@@ -28,6 +28,9 @@ LOG_MODULE_REGISTER(dw1000, LOG_LEVEL_INF);
 #include <zephyr/net/ieee802154_radio.h>
 #include "ieee802154_dw1000_regs.h"
 
+#include <zephyr/drivers/ieee802154/dw1000.h>
+
+
 #define DT_DRV_COMPAT decawave_dw1000
 
 #define DWT_FCS_LENGTH			2U
@@ -64,6 +67,8 @@ LOG_MODULE_REGISTER(dw1000, LOG_LEVEL_INF);
 #define UWB_PHY_TDSYM_DATA_6M8		128.21
 
 #define DWT_WORK_QUEUE_STACK_SIZE	512
+
+#define DWT_OTP_DELAY_ADDR 0x1C
 
 static struct k_work_q dwt_work_queue;
 static K_KERNEL_STACK_DEFINE(dwt_work_queue_stack,
@@ -114,6 +119,12 @@ struct dwt_context {
 	bool cca_busy;
 	uint16_t sleep_mode;
 	uint8_t mac_addr[8];
+
+	bool delayed_tx_short_ts_set;
+	uint32_t delayed_tx_short_ts;
+
+	uint64_t rx_ts;
+	uint8_t rx_ttcko_rc_phase;
 };
 
 static const struct dwt_hi_cfg dw1000_0_config = {
@@ -455,8 +466,15 @@ static inline void dwt_irq_handle_rx(const struct device *dev, uint32_t sys_stat
 		uint64_t ts_nsec;
 
 		memcpy(ts_buf, rx_inf_reg.rx_time, DWT_RX_TIME_RX_STAMP_LEN);
-		ts_nsec = (sys_get_le64(ts_buf) * DWT_TS_TIME_UNITS_FS) / 1000000U;
+
+		uint64_t rx_ts = sys_get_le64(ts_buf);
+		ctx->rx_ts = rx_ts;
+
+		ts_nsec = rx_ts * DWT_TS_TIME_UNITS_FS;
 		net_pkt_set_timestamp_ns(pkt, ts_nsec);
+
+		// set phase offset, 7 unsigned 7 bits
+		ctx->rx_ttcko_rc_phase = (rx_inf_reg.rx_ttcko[4] & 0x7FUL);
 	}
 
 	/* See 4.7.2 Estimating the receive signal power */
@@ -468,6 +486,11 @@ static inline void dwt_irq_handle_rx(const struct device *dev, uint32_t sys_stat
 	}
 
 	if (rx_pacc != 0) {
+
+		// ctx->rx_cir_pwr = cir_pwr;
+		// ctx->rx_pacc = rx_pacc;
+		// ctx->rx_a_const = a_const
+
 #if defined(CONFIG_NEWLIB_LIBC)
 		/* From 4.7.2 Estimating the receive signal power */
 		rx_level = 10.0 * log10f(cir_pwr * BIT(17) /
@@ -564,7 +587,30 @@ static void dwt_irq_handle_error(const struct device *dev, uint32_t sys_stat)
 	/* Receiver reset necessary, see 4.1.6 RX Message timestamp */
 	dwt_reset_rfrx(dev);
 
-	LOG_INF("RX error event");
+	if (sys_stat & DWT_SYS_STATUS_RXPHE) {
+		LOG_INF("RX error DWT_SYS_STATUS_RXPHE");
+	}
+
+	if (sys_stat & DWT_SYS_STATUS_RXFCE) {
+		LOG_INF("RX error DWT_SYS_STATUS_RXFCE");
+	}
+
+	if (sys_stat & DWT_SYS_STATUS_RXRFSL) {
+		LOG_INF("RX error DWT_SYS_STATUS_RXRFSL");
+	}
+
+	if (sys_stat & DWT_SYS_STATUS_RXOVRR) {
+		LOG_INF("RX error DWT_SYS_STATUS_RXOVRR");
+	}
+
+	if (sys_stat & DWT_SYS_STATUS_RXSFDTO) {
+		LOG_INF("RX error DWT_SYS_STATUS_RXSFDTO");
+	}
+
+	if (sys_stat & DWT_SYS_STATUS_AFFREJ) {
+		LOG_INF("RX error DWT_SYS_STATUS_AFFREJ");
+	}
+
 	if (atomic_test_bit(&ctx->state, DWT_STATE_CCA)) {
 		k_sem_give(&ctx->phy_sem);
 		ctx->cca_busy = true;
@@ -616,7 +662,8 @@ static void dwt_gpio_callback(const struct device *dev,
 	struct dwt_context *ctx = CONTAINER_OF(cb, struct dwt_context, gpio_cb);
 
 	LOG_DBG("IRQ callback triggered %p", ctx);
-	k_work_submit_to_queue(&dwt_work_queue, &ctx->irq_cb_work);
+	k_work_submit(&ctx->irq_cb_work);
+	// k_work_submit_to_queue(&dwt_work_queue, &ctx->irq_cb_work);
 }
 
 static enum ieee802154_hw_caps dwt_get_capabilities(const struct device *dev)
@@ -804,10 +851,15 @@ static int dwt_tx(const struct device *dev, enum ieee802154_tx_mode tx_mode,
 		 * tx_time is the high 32-bit of the 40-bit system
 		 * time value at which to send the message.
 		 */
-		tmp_fs = net_pkt_timestamp_ns(pkt);
-		tmp_fs *= 1000U * 1000U;
+		if (ctx->delayed_tx_short_ts_set) {
+			tx_time = ctx->delayed_tx_short_ts;
+			ctx->delayed_tx_short_ts_set = 0; // disable the flag again
+		} else {
+			tmp_fs = net_pkt_timestamp_ns(pkt);
+			tmp_fs *= 1000U * 1000U;
+			tx_time = (tmp_fs / DWT_TS_TIME_UNITS_FS) >> 8;
+		}
 
-		tx_time = (tmp_fs / DWT_TS_TIME_UNITS_FS) >> 8;
 		sys_ctrl |= DWT_SYS_CTRL_TXDLYS;
 		/* DX_TIME is 40-bit register */
 		dwt_reg_write_u32(dev, DWT_DX_TIME_ID, 1, tx_time);
@@ -851,7 +903,11 @@ static int dwt_tx(const struct device *dev, enum ieee802154_tx_mode tx_mode,
 		uint32_t sys_stat = dwt_reg_read_u32(dev, DWT_SYS_STATUS_ID, 0);
 
 		if (sys_stat & DWT_SYS_STATUS_HPDWARN) {
-			LOG_WRN("Half Period Delay Warning");
+			// LOG_WRN("Half Period Delay Warning Current: %llu", dwt_system_ts(dev));
+			uint64_t planned_us = dwt_short_ts_to_fs(tx_time) / 1000000000U;
+			uint64_t current_us = dwt_ts_to_fs(dwt_system_ts(dev)) / 1000000000U;
+			LOG_WRN("Half Period Delay Warning (planned: %llu, current: %llu)",
+				planned_us, current_us);
 		}
 	}
 
@@ -893,7 +949,7 @@ error:
 	return -EIO;
 }
 
-static void dwt_set_frame_filter(const struct device *dev,
+void dwt_set_frame_filter(const struct device *dev,
 				 bool ff_enable, uint8_t ff_type)
 {
 	uint32_t sys_cfg_ff = ff_enable ? DWT_SYS_CFG_FFE : 0;
@@ -1155,11 +1211,166 @@ static uint32_t dwt_otpmem_read(const struct device *dev, uint16_t otp_addr)
 	return dwt_reg_read_u32(dev, DWT_OTP_IF_ID, DWT_OTP_RDAT);
 }
 
+void dwt_set_antenna_delay_rx(const struct device *dev, uint16_t rx_delay_ts)
+{
+	dwt_reg_write_u16(dev, DWT_LDE_IF_ID, DWT_LDE_RXANTD_OFFSET, rx_delay_ts);
+}
+void dwt_set_antenna_delay_tx(const struct device *dev, uint16_t tx_delay_ts)
+{
+	dwt_reg_write_u16(dev, DWT_TX_ANTD_ID, DWT_TX_ANTD_OFFSET, tx_delay_ts);
+}
+uint16_t dwt_antenna_delay_rx(const struct device *dev)
+{
+	return dwt_reg_read_u16(dev, DWT_LDE_IF_ID, DWT_LDE_RXANTD_OFFSET);
+}
+
+inline uint16_t dwt_antenna_delay_tx(const struct device *dev)
+{
+	return dwt_reg_read_u16(dev, DWT_TX_ANTD_ID, DWT_TX_ANTD_OFFSET);
+}
+
+uint32_t dwt_otp_antenna_delay(const struct device *dev)
+{
+	return dwt_otpmem_read(dev, DWT_OTP_DELAY_ADDR);
+}
+
+inline void dwt_set_delayed_tx_short_ts(const struct device *dev, uint32_t short_ts)
+{
+	struct dwt_context *ctx = dev->data;
+	ctx->delayed_tx_short_ts = short_ts;
+	ctx->delayed_tx_short_ts_set = 1;
+}
+
+inline uint64_t dwt_system_ts(const struct device *dev)
+{
+	uint8_t ts_buf[sizeof(uint64_t)] = {0};
+
+	// TODO: Should we lock?!
+	// k_sem_take(&ctx->dev_lock, K_FOREVER);
+	dwt_register_read(dev, DWT_SYS_TIME_ID, DWT_SYS_TIME_OFFSET, DWT_SYS_TIME_LEN, ts_buf);
+	// k_sem_give(&ctx->dev_lock);
+	return sys_get_le64(ts_buf);
+}
+
+inline uint32_t dwt_system_short_ts(const struct device *dev)
+{
+	uint64_t ts = dwt_system_ts(dev);
+	return (uint32_t)(ts >> 8);
+}
+
+uint64_t dwt_ts_to_fs(uint64_t ts)
+{
+	return ts * DWT_TS_TIME_UNITS_FS;
+}
+
+uint64_t dwt_fs_to_ts(uint64_t fs)
+{
+	return fs / DWT_TS_TIME_UNITS_FS;
+}
+
+uint64_t dwt_short_ts_to_fs(uint32_t ts)
+{
+	uint64_t tmp_ts = (uint64_t)ts;
+	return (tmp_ts << 8) * DWT_TS_TIME_UNITS_FS;
+}
+
+uint32_t dwt_fs_to_short_ts(uint64_t fs)
+{
+	return (fs / DWT_TS_TIME_UNITS_FS) >> 8;
+}
+
+inline uint64_t dwt_estimate_actual_tx_ts(uint32_t planned_short_ts, uint16_t tx_antenna_delay)
+{
+	return (((uint64_t)(planned_short_ts & 0xFFFFFFFEUL)) << 8) + tx_antenna_delay;
+}
+
+uint64_t dwt_plan_delayed_tx(const struct device *dev, uint64_t uus_delay)
+{
+	// query the antenna delay before
+	uint16_t antenna_delay = dwt_antenna_delay_tx(dev);
+	uint64_t cur_ts = dwt_system_ts(dev);
+	/* UWB microsecond (uus) to device time unit (dtu, around 15.65 ps) conversion factor.
+	 * 1 uus = 512 / 499.2 µs and 1 µs = 499.2 * 128 dtu. */
+	uint32_t planned_tx_short_ts = (cur_ts + (uus_delay * 65536)) >> 8;
+	// LOG_WRN("current %u planned %u", (uint32_t)(cur_ts >> 8), planned_tx_short_ts);
+	dwt_set_delayed_tx_short_ts(dev, planned_tx_short_ts);
+
+	uint64_t estimated_ts = dwt_estimate_actual_tx_ts(planned_tx_short_ts, antenna_delay);
+	// LOG_WRN("Current: %llu, Plan: %llu, Est: %llu", cur_ts, (uint64_t)(planned_tx_short_ts)
+	// << 8, estimated_ts); LOG_WRN("Current: %llu, Plan: %llu, Est: %llu", dwt_ts_to_fs(cur_ts)
+	// /  1000000000U, dwt_ts_to_fs((uint64_t)(planned_tx_short_ts) << 8) /  1000000000U,
+	// dwt_ts_to_fs(estimated_ts) /  1000000000U);
+
+	return estimated_ts;
+}
+
+uint64_t dwt_rx_ts(const struct device *dev)
+{
+	struct dwt_context *ctx = dev->data;
+	return ctx->rx_ts;
+}
+
+uint8_t dwt_rx_ttcko_rc_phase(const struct device *dev)
+{
+	struct dwt_context *ctx = dev->data;
+	return ctx->rx_ttcko_rc_phase;
+}
+
+#define B20_SIGN_EXTEND_TEST (0x00100000UL)
+#define B20_SIGN_EXTEND_MASK (0xFFF00000UL)
+
+int dwt_readcarrierintegrator(const struct device *dev)
+{
+	uint32_t regval = 0;
+	uint8_t buf[DWT_DRX_CARRIER_INT_LEN];
+	/* Read 3 bytes into buffer (21-bit quantity) */
+	dwt_spi_transfer(dev, DWT_DRX_CONF_ID, DWT_DRX_CARRIER_INT_OFFSET, sizeof(buf), buf, false);
+
+	for (int j = 2; j >= 0; j--) // arrange the three bytes into an unsigned integer value
+	{
+		regval = (regval << 8) + buf[j];
+	}
+
+	if (regval & B20_SIGN_EXTEND_TEST) {
+		regval |= B20_SIGN_EXTEND_MASK; // sign extend bit #20 to whole word
+	} else {
+		regval &= DWT_DRX_CARRIER_INT_MASK; // make sure upper bits are clear if not sign
+						    // extending
+	}
+
+	return (int)regval; // cast unsigned value to signed quantity.
+}
+
+// Multiplication factors to convert carrier integrator value to a frequency offset in Hertz
+
+#define DWT_FREQ_OFFSET_MULTIPLIER	 (998.4e6 / 2.0 / 1024.0 / 131072.0)
+#define DWT_FREQ_OFFSET_MULTIPLIER_110KB (998.4e6 / 2.0 / 8192.0 / 131072.0)
+
+// Multiplication factors to convert frequency offset in Hertz to PPM crystal offset
+// NB: also changes sign so a positive value means the local RX clock is running slower than the
+// remote TX device.
+
+#define DWT_HERTZ_TO_PPM_MULTIPLIER_CHAN_1 (-1.0e6 / 3494.4e6)
+#define DWT_HERTZ_TO_PPM_MULTIPLIER_CHAN_2 (-1.0e6 / 3993.6e6)
+#define DWT_HERTZ_TO_PPM_MULTIPLIER_CHAN_3 (-1.0e6 / 4492.8e6)
+#define DWT_HERTZ_TO_PPM_MULTIPLIER_CHAN_5 (-1.0e6 / 6489.6e6)
+
+float dwt_rx_clock_ratio_offset(const struct device *dev)
+{
+	// TODO: Use correct channel!
+	return dwt_readcarrierintegrator(dev) *
+	       (DWT_FREQ_OFFSET_MULTIPLIER * DWT_HERTZ_TO_PPM_MULTIPLIER_CHAN_5 / 1.0e6);
+}
+
 static int dwt_initialise_dev(const struct device *dev)
 {
 	struct dwt_context *ctx = dev->data;
 	uint32_t otp_val = 0;
+	uint32_t otp_antenna_delay = 0;
 	uint8_t xtal_trim;
+
+	ctx->delayed_tx_short_ts_set = 0;
+	ctx->delayed_tx_short_ts = 0;
 
 	dwt_set_sysclks_xti(dev, false);
 	ctx->sleep_mode = 0;
@@ -1209,6 +1420,9 @@ static int dwt_initialise_dev(const struct device *dev)
 	LOG_DBG("Vbat 0x%02x", dwt_otpmem_read(dev, DWT_OTP_VBAT_ADDR));
 	LOG_DBG("Vtemp 0x%02x", dwt_otpmem_read(dev, DWT_OTP_VTEMP_ADDR));
 
+	otp_antenna_delay = dwt_otpmem_read(dev, DWT_OTP_DELAY_ADDR);
+	LOG_INF("OTP AntDelay 0x%02x", otp_antenna_delay); // TODO: change this to a debug log
+
 	if (xtal_trim == 0) {
 		/* Set to default */
 		xtal_trim = DWT_FS_XTALT_MIDRANGE;
@@ -1236,11 +1450,9 @@ static int dwt_initialise_dev(const struct device *dev)
 
 	dwt_set_spi_fast(dev);
 
-	/* Setup antenna delay values */
-	dwt_reg_write_u16(dev, DWT_LDE_IF_ID, DWT_LDE_RXANTD_OFFSET,
-			  DW1000_RX_ANT_DLY);
-	dwt_reg_write_u16(dev, DWT_TX_ANTD_ID, DWT_TX_ANTD_OFFSET,
-			  DW1000_TX_ANT_DLY);
+	/* Setup default antenna delay values */
+	dwt_set_antenna_delay_rx(dev, DW1000_RX_ANT_DLY);
+	dwt_set_antenna_delay_tx(dev, DW1000_TX_ANT_DLY);
 
 	/* Clear AON_CFG1 register */
 	dwt_reg_write_u8(dev, DWT_AON_ID, DWT_AON_CFG1_OFFSET, 0);
@@ -1642,6 +1854,11 @@ static inline uint8_t *get_mac(const struct device *dev)
 	dw1000->mac_addr[0] = (dw1000->mac_addr[0] & ~0x01) | 0x02;
 
 	return dw1000->mac_addr;
+}
+
+uint8_t *dwt_get_mac(const struct device *dev)
+{
+	return get_mac(dev);
 }
 
 static void dwt_iface_api_init(struct net_if *iface)
