@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "hal/nrf_spi.h"
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(dw1000, LOG_LEVEL_INF);
 
@@ -23,19 +24,95 @@ LOG_MODULE_REGISTER(dw1000, LOG_LEVEL_INF);
 #include <math.h>
 
 #include <zephyr/drivers/gpio.h>
+
+#define ZEPHYR_SPI 0
+#define SPIM 0
+#if ZEPHYR_SPI
 #include <zephyr/drivers/spi.h>
+#else
+/* #include <nrfx_spi.h> */
+#if SPIM
+#include <nrfx_spim.h>
+#else
+#include <nrfx_spi.h>
+#endif
+#include <drivers/src/prs/nrfx_prs.h>
+#include <zephyr/drivers/pinctrl.h>
+#endif
+
+#if !ZEPHYR_SPI
+#if SPIM
+#define SPIM_NODE DT_NODELABEL(spi2)
+PINCTRL_DT_DEFINE(SPIM_NODE);
+#else
+#define SPI_NODE DT_NODELABEL(spi2)
+PINCTRL_DT_DEFINE(SPI_NODE);
+#endif
+
+
+static K_SEM_DEFINE(spi_transfer_finished, 0, 1);
+
+#if SPIM
+static nrfx_spim_t spi = NRFX_SPIM_INSTANCE(2);
+#else
+static nrfx_spi_t spi = NRFX_SPI_INSTANCE(2);
+#endif
+static bool spi_initialized;
+#endif
+
 
 #include <zephyr/net/ieee802154_radio.h>
 #include "ieee802154_dw1000_regs.h"
 
 #include <zephyr/drivers/ieee802154/dw1000.h>
 
+#define USE_GPIO_DEBUG 1
+#if USE_GPIO_DEBUG
+
+#define DEB0_NODE DT_ALIAS(deb0)
+#define DEB1_NODE DT_ALIAS(deb1)
+
+static const struct gpio_dt_spec deb0 = GPIO_DT_SPEC_GET(DEB0_NODE, gpios);;
+static const struct gpio_dt_spec deb1 = GPIO_DT_SPEC_GET(DEB1_NODE, gpios);;
+
+static void setup_debug_gpios() {
+	gpio_pin_configure_dt(&deb0, GPIO_OUTPUT | GPIO_OUTPUT_ACTIVE);
+	gpio_pin_configure_dt(&deb1, GPIO_OUTPUT | GPIO_OUTPUT_ACTIVE);
+}
+
+#define TOGGLE_DEBUG_GPIO(GPIO) do { \
+    gpio_pin_toggle_dt(&deb##GPIO); \
+} while(0)
+
+#define SET_GPIO_HIGH(GPIO) do { \
+		gpio_pin_set_dt(&deb##GPIO, 1);	\
+} while(0)
+
+#define SET_GPIO_LOW(GPIO) do { \
+		gpio_pin_set_dt(&deb##GPIO, 0);	\
+} while(0)
+#else
+#define TOGGLE_DEBUG_GPIO(GPIO)
+#define TOGGLE_DEBUG_GPIOS()
+#endif
 
 #define DT_DRV_COMPAT decawave_dw1000
 
 #define DWT_FCS_LENGTH			2U
-#define DWT_SPI_CSWAKEUP_FREQ		500000U
-#define DWT_SPI_SLOW_FREQ		2000000U
+
+#if ZEPHYR_SPI
+#define DWT_SPI_CSWAKEUP_FREQ 500000U
+#define DWT_SPI_SLOW_FREQ 2000000U
+#else
+#define DWT_SPIM_CSWAKEUP_FREQ NRFX_KHZ_TO_HZ(500)
+#define DWT_SPIM_SLOW_FREQ     NRFX_MHZ_TO_HZ(2)
+#define DWT_SPIM_FAST_FREQ     NRFX_MHZ_TO_HZ(8)
+
+#define DWT_SPI_CSWAKEUP_FREQ NRF_SPI_FREQ_500K
+#define DWT_SPI_SLOW_FREQ     NRF_SPI_FREQ_2M
+#define DWT_SPI_FAST_FREQ     NRF_SPI_FREQ_8M
+#endif
+
 #define DWT_SPI_TRANS_MAX_HDR_LEN	3
 #define DWT_SPI_TRANS_REG_MAX_RANGE	0x3F
 #define DWT_SPI_TRANS_SHORT_MAX_OFFSET	0x7F
@@ -95,7 +172,9 @@ struct dwt_phy_config {
 };
 
 struct dwt_hi_cfg {
+#if ZEPHYR_SPI
 	struct spi_dt_spec bus;
+#endif
 	struct gpio_dt_spec irq_gpio;
 	struct gpio_dt_spec rst_gpio;
 };
@@ -107,8 +186,23 @@ struct dwt_hi_cfg {
 struct dwt_context {
 	const struct device *dev;
 	struct net_if *iface;
+
+
+#if ZEPHYR_SPI
 	const struct spi_config *spi_cfg;
 	struct spi_config spi_cfg_slow;
+#else
+#if SPIM
+	nrfx_spim_config_t spi_cfg;
+#else
+	nrfx_spi_config_t spi_cfg;
+#endif
+
+	const struct pinctrl_dev_config *pcfg;
+
+
+#endif
+
 	struct gpio_callback gpio_cb;
 	struct k_sem dev_lock;
 	struct k_sem phy_sem;
@@ -128,14 +222,19 @@ struct dwt_context {
 };
 
 static const struct dwt_hi_cfg dw1000_0_config = {
+#if ZEPHYR_SPI
 	.bus = SPI_DT_SPEC_INST_GET(0, SPI_WORD_SET(8), 0),
+#endif
 	.irq_gpio = GPIO_DT_SPEC_INST_GET(0, int_gpios),
 	.rst_gpio = GPIO_DT_SPEC_INST_GET(0, reset_gpios),
 };
 
 static struct dwt_context dwt_0_context = {
-	.dev_lock = Z_SEM_INITIALIZER(dwt_0_context.dev_lock, 1,  1),
-	.phy_sem = Z_SEM_INITIALIZER(dwt_0_context.phy_sem, 0,  1),
+	.dev_lock = Z_SEM_INITIALIZER(dwt_0_context.dev_lock, 1, 1),
+	.phy_sem = Z_SEM_INITIALIZER(dwt_0_context.phy_sem, 0, 1),
+#if !ZEPHYR_SPI
+	.pcfg = PINCTRL_DT_DEV_CONFIG_GET(SPI_NODE),
+#endif
 	.rf_cfg = {
 		.channel = 5,
 		.dr = DWT_BR_6M8,
@@ -162,6 +261,7 @@ struct dwt_rx_info_regs {
 
 static int dwt_configure_rf_phy(const struct device *dev);
 
+#if ZEPHYR_SPI
 static int dwt_spi_read(const struct device *dev,
 			uint16_t hdr_len, const uint8_t *hdr_buf,
 			uint32_t data_len, uint8_t *data)
@@ -230,6 +330,93 @@ static int dwt_spi_write(const struct device *dev,
 
 	return 0;
 }
+#else
+
+static volatile size_t received;
+static bool spi_transfer(const uint8_t *tx_data, size_t tx_data_len,
+			  uint8_t *rx_buf, size_t rx_buf_size)
+{
+	nrfx_err_t err;
+#if SPIM
+	nrfx_spim_xfer_desc_t
+#else
+	nrfx_spi_xfer_desc_t
+#endif
+		xfer_desc = {
+		.p_tx_buffer = tx_data,
+		.tx_length = tx_data_len,
+		.p_rx_buffer = rx_buf,
+		.rx_length = rx_buf_size,
+	};
+
+#if SPIM
+	err = nrfx_spim_xfer(&spi, &xfer_desc, 0);
+#else
+	err = nrfx_spi_xfer(&spi, &xfer_desc, 0);
+#endif
+
+	if (err != NRFX_SUCCESS) {
+		printk("nrfx_spi_xfer() failed: 0x%08x\n", err);
+		return false;
+	}
+
+#if WITH_SPI_IRQ
+	if (k_sem_take(&spi_transfer_finished, K_MSEC(100)) != 0) {
+		printk("SPI transfer timeout\n");
+		return false;
+	}
+#endif
+
+	received = rx_buf_size;
+	return true;
+}
+
+static int dwt_spi_read(const struct device *dev, uint16_t hdr_len, const uint8_t *hdr_buf,
+			uint32_t data_len, uint8_t *data)
+{
+	// merge together buffers, before calling spi_transfer
+	uint8_t transfer_buf[hdr_len + data_len];
+
+	// Copy header to transfer buffer
+	memcpy(transfer_buf, hdr_buf, hdr_len);
+
+	// Copy data to transfer buffer, starting right after the header
+	memcpy(transfer_buf + hdr_len, data, data_len);
+
+	// Now call spi_transfer with the combined buffer
+	uint8_t rx_buf[hdr_len + data_len]; // Assuming you want to read the same amount as written
+	bool success = spi_transfer(transfer_buf, hdr_len + data_len, rx_buf, hdr_len + data_len);
+
+	if (!success) {
+		printk("SPI transfer failed\n");
+		return -1; // Or any other error handling code
+	}
+
+	// Assuming the received data should be copied back to 'data'
+	memcpy(data, rx_buf + hdr_len, data_len);
+
+	/* printk("Received data: "); */
+	/* for (uint32_t i = 0; i < data_len; i++) { */
+	/* 	printk("%02x ", data[i]); // Print each byte of received data in hex format */
+	/* } */
+	/* printk("\n"); // New line after printing all data */
+
+
+	return 0; // Success
+}
+
+// isn't it same same?
+static int dwt_spi_write(const struct device *dev, uint16_t hdr_len, const uint8_t *hdr_buf,
+	uint32_t data_len, uint8_t *data)
+{
+	dwt_spi_read(dev, hdr_len, hdr_buf, data_len, data);
+
+	return 0;
+}
+
+#endif
+
+
 
 /* See 2.2.1.2 Transaction formats of the SPI interface */
 static int dwt_spi_transfer(const struct device *dev,
@@ -419,6 +606,8 @@ static inline void dwt_irq_handle_rx(const struct device *dev, uint32_t sys_stat
 	uint8_t *fctrl;
 	int8_t rx_level = INT8_MIN;
 
+	SET_GPIO_HIGH(1);
+
 	LOG_DBG("RX OK event, SYS_STATUS 0x%08x", sys_stat);
 	flags_to_clear = sys_stat & DWT_SYS_STATUS_ALL_RX_GOOD;
 
@@ -542,6 +731,8 @@ rx_out_enable_rx:
 		dwt_reg_write_u16(dev, DWT_SYS_CTRL_ID, DWT_SYS_CTRL_OFFSET,
 				  DWT_SYS_CTRL_RXENAB);
 	}
+
+	SET_GPIO_LOW(1);
 }
 
 static void dwt_irq_handle_tx(const struct device *dev, uint32_t sys_stat)
@@ -631,7 +822,9 @@ static void dwt_irq_work_handler(struct k_work *item)
 
 	k_sem_take(&ctx->dev_lock, K_FOREVER);
 
+	SET_GPIO_HIGH(1);
 	sys_stat = dwt_reg_read_u32(dev, DWT_SYS_STATUS_ID, 0);
+	SET_GPIO_LOW(1);
 
 	if (sys_stat & DWT_SYS_STATUS_RXFCG) {
 		if (atomic_test_bit(&ctx->state, DWT_STATE_CCA)) {
@@ -661,8 +854,12 @@ static void dwt_gpio_callback(const struct device *dev,
 {
 	struct dwt_context *ctx = CONTAINER_OF(cb, struct dwt_context, gpio_cb);
 
+	SET_GPIO_HIGH(1);
+
 	LOG_DBG("IRQ callback triggered %p", ctx);
 	k_work_submit(&ctx->irq_cb_work);
+
+	SET_GPIO_LOW(1);
 	// k_work_submit_to_queue(&dwt_work_queue, &ctx->irq_cb_work);
 }
 
@@ -835,6 +1032,12 @@ static int dwt_tx(const struct device *dev, enum ieee802154_tx_mode tx_mode,
 	uint32_t tx_fctrl;
 	uint8_t sys_ctrl = DWT_SYS_CTRL_TXSTRT;
 
+	uint32_t tx1, tx2, tx3, tx4, tx5;
+
+	tx1 = k_cycle_get_32();
+
+	SET_GPIO_HIGH(0);
+
 	if (atomic_test_and_set_bit(&ctx->state, DWT_STATE_TX)) {
 		LOG_ERR("Transceiver busy");
 		return -EBUSY;
@@ -875,6 +1078,9 @@ static int dwt_tx(const struct device *dev, enum ieee802154_tx_mode tx_mode,
 
 	LOG_HEXDUMP_DBG(frag->data, len, "TX buffer:");
 
+	tx2 = k_cycle_get_32();
+
+
 	/*
 	 * See "3 Message Transmission" in DW1000 User Manual for
 	 * more details about transmission configuration.
@@ -895,6 +1101,8 @@ static int dwt_tx(const struct device *dev, enum ieee802154_tx_mode tx_mode,
 	dwt_reg_write_u32(dev, DWT_TX_FCTRL_ID, 0, tx_fctrl);
 
 	dwt_disable_txrx(dev);
+	SET_GPIO_LOW(0);
+	SET_GPIO_HIGH(0);
 
 	/* Begin transmission */
 	dwt_reg_write_u8(dev, DWT_SYS_CTRL_ID, DWT_SYS_CTRL_OFFSET, sys_ctrl);
@@ -914,6 +1122,7 @@ static int dwt_tx(const struct device *dev, enum ieee802154_tx_mode tx_mode,
 	k_sem_give(&ctx->dev_lock);
 	/* Wait for the TX confirmed event */
 	k_sem_take(&ctx->phy_sem, K_FOREVER);
+	SET_GPIO_LOW(0);
 
 	if (IS_ENABLED(CONFIG_NET_PKT_TIMESTAMP)) {
 		uint8_t ts_buf[sizeof(uint64_t)] = {0};
@@ -1067,17 +1276,37 @@ static void dwt_set_spi_slow(const struct device *dev, const uint32_t freq)
 {
 	struct dwt_context *ctx = dev->data;
 
+#if ZEPHYR_SPI
 	ctx->spi_cfg_slow.frequency = freq;
 	ctx->spi_cfg = &ctx->spi_cfg_slow;
+#else
+	ctx->spi_cfg.frequency = freq;
+#if SPIM
+	nrfx_spim_reconfigure(&spi, &ctx->spi_cfg);
+#else
+	nrfx_spi_reconfigure(&spi, &ctx->spi_cfg);
+#endif
+	/* pinctrl_apply_state(ctx->pcfg, PINCTRL_STATE_DEFAULT); */
+#endif
 }
 
 /* SPI speed in IDLE, RX, and TX state */
 static void dwt_set_spi_fast(const struct device *dev)
 {
-	const struct dwt_hi_cfg *hi_cfg = dev->config;
 	struct dwt_context *ctx = dev->data;
 
+#if ZEPHYR_SPI
+	const struct dwt_hi_cfg *hi_cfg = dev->config;
 	ctx->spi_cfg = &hi_cfg->bus.config;
+#else
+	ctx->spi_cfg.frequency = DWT_SPI_FAST_FREQ;
+#if SPIM
+	nrfx_spim_reconfigure(&spi, &ctx->spi_cfg);
+#else
+	nrfx_spi_reconfigure(&spi, &ctx->spi_cfg);
+#endif
+	/* pinctrl_apply_state(ctx->pcfg, PINCTRL_STATE_DEFAULT); */
+#endif
 }
 
 static void dwt_set_rx_mode(const struct device *dev)
@@ -1733,6 +1962,101 @@ static int dwt_configure_rf_phy(const struct device *dev)
 	return 0;
 }
 
+
+#if !ZEPHYR_SPI
+#if SPIM
+static void spi_handler(const nrfx_spim_evt_t *p_event, void *p_context)
+{
+	if (p_event->type == NRFX_SPIM_EVENT_DONE) {
+		k_sem_give(&spi_transfer_finished);
+	}
+}
+#else
+static void spi_handler(const nrfx_spi_evt_t *p_event, void *p_context)
+{
+	if (p_event->type == NRFX_SPI_EVENT_DONE) {
+		k_sem_give(&spi_transfer_finished);
+	}
+}
+#endif
+
+static bool dwt_spi_init(const struct device *dev)
+{
+	int ret;
+	nrfx_err_t err;
+	struct dwt_context *ctx = dev->data;
+
+	/* IRQ_CONNECT(DT_IRQN(SPI_NODE), DT_IRQ(SPI_NODE, priority), nrfx_isr, */
+	/* 	    nrfx_prs_box_2_irq_phandler, 0); */
+
+#if SPIM
+	IRQ_CONNECT(DT_IRQN(SPI_NODE), DT_IRQ(SPI_NODE, priority), nrfx_isr,
+		    nrfx_spim_2_irq_handler, 0);
+#else
+#if WITH_SPI_IRQ
+	IRQ_DIRECT_CONNECT(DT_IRQN(SPI_NODE), DT_IRQ(SPI_NODE, priority), nrfx_spi_2_irq_handler,
+			   0);
+#endif
+#endif
+
+
+	if (spi_initialized) {
+		return true;
+	}
+
+	// ACHTUNG! use NRF_SPI_PIN_NOT_CONNECTED for NRFX_SPIM_DEFAULT_CONFIG
+
+#if SPIM
+	nrfx_spim_config_t spi_config = NRFX_SPIM_DEFAULT_CONFIG(
+		NRF_SPI_PIN_NOT_CONNECTED, NRF_SPI_PIN_NOT_CONNECTED, NRF_SPI_PIN_NOT_CONNECTED,
+		NRF_DT_GPIOS_TO_PSEL(SPI_NODE, cs_gpios))
+		;
+#else
+
+#define SPI_PINCTRL_NODE DT_CHILD(DT_PINCTRL_0(SPI_NODE, 0), group1)
+#define SCK_PIN (DT_PROP_BY_IDX(SPI_PINCTRL_NODE, psels, 0) & 0x3F)
+#define MOSI_PIN (DT_PROP_BY_IDX(SPI_PINCTRL_NODE, psels, 1) & 0x3F)
+#define MISO_PIN         (DT_PROP_BY_IDX(SPI_PINCTRL_NODE, psels, 2) & 0x3F)
+
+	nrfx_spi_config_t spi_config = NRFX_SPI_DEFAULT_CONFIG(
+		SCK_PIN, MOSI_PIN, MISO_PIN,
+		NRF_DT_GPIOS_TO_PSEL(SPI_NODE, cs_gpios));
+#endif
+	spi_config.frequency = DWT_SPI_SLOW_FREQ;
+	spi_config.skip_gpio_cfg = false;
+	spi_config.skip_psel_cfg = false; // only when using pinctrl
+	spi_config.mode = NRF_SPI_MODE_0;
+
+	ctx->spi_cfg = spi_config;
+
+	/* ret = pinctrl_apply_state(ctx->pcfg, PINCTRL_STATE_DEFAULT); */
+
+	if (ret < 0) {
+		return ret;
+	}
+
+#if SPIM
+	err = nrfx_spim_init(&spi, &ctx->spi_cfg, spi_handler, NULL);
+#else
+#if WITH_SPI_IRQ
+	err = nrfx_spi_init(&spi, &ctx->spi_cfg, spi_handler, NULL);
+#else
+	err = nrfx_spi_init(&spi, &ctx->spi_cfg, NULL, NULL);
+#endif
+#endif
+	if (err != NRFX_SUCCESS) {
+		printk("nrfx_spi_init() failed: 0x%08x\n", err);
+		return false;
+	}
+
+	spi_initialized = true;
+	printk("Switched to SPI\n");
+	return true;
+}
+#endif
+
+
+
 static int dw1000_init(const struct device *dev)
 {
 	struct dwt_context *ctx = dev->data;
@@ -1741,7 +2065,14 @@ static int dw1000_init(const struct device *dev)
 	LOG_INF("Initialize DW1000 Transceiver");
 	k_sem_init(&ctx->phy_sem, 0, 1);
 
+#if USE_GPIO_DEBUG
+	setup_debug_gpios();
+#endif
+
+
+
 	/* slow SPI config */
+#if ZEPHYR_SPI
 	memcpy(&ctx->spi_cfg_slow, &hi_cfg->bus.config, sizeof(ctx->spi_cfg_slow));
 	ctx->spi_cfg_slow.frequency = DWT_SPI_SLOW_FREQ;
 
@@ -1749,6 +2080,9 @@ static int dw1000_init(const struct device *dev)
 		LOG_ERR("SPI device not ready");
 		return -ENODEV;
 	}
+#else
+	dwt_spi_init(dev);
+#endif
 
 	dwt_set_spi_slow(dev, DWT_SPI_SLOW_FREQ);
 
