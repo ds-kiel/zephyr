@@ -26,7 +26,9 @@ LOG_MODULE_REGISTER(dw1000, LOG_LEVEL_INF);
 #include <zephyr/drivers/gpio.h>
 
 #define ZEPHYR_SPI 0
-#define SPIM 0
+#define SPIM       0
+#define EXTREMELY_LEAN_DRIVER 0
+
 #if ZEPHYR_SPI
 #include <zephyr/drivers/spi.h>
 #else
@@ -182,6 +184,14 @@ struct dwt_hi_cfg {
 #define DWT_STATE_TX		0
 #define DWT_STATE_CCA		1
 #define DWT_STATE_RX_DEF_ON	2
+#define DWT_STATE_IRQ_POLLING_EMU	3
+
+// these are used when using the irq handler in a pseudo polling manner in the dwt ranging methods
+#define DWT_IRQ_NONE 0
+#define DWT_IRQ_TX 1
+#define DWT_IRQ_RX 2
+#define DWT_IRQ_RX_TIMEOUT 4
+#define DWT_IRQ_ERR 5
 
 struct dwt_context {
 	const struct device *dev;
@@ -211,6 +221,7 @@ struct dwt_context {
 	struct dwt_phy_config rf_cfg;
 	atomic_t state;
 	bool cca_busy;
+	uint8_t phy_irq_event;
 	uint16_t sleep_mode;
 	uint8_t mac_addr[8];
 
@@ -556,9 +567,8 @@ static void dwt_disable_txrx(const struct device *dev)
 	dwt_setup_int(dev, true);
 }
 
-/* timeout time in units of 1.026 microseconds */
-static int dwt_enable_rx(const struct device *dev, uint16_t timeout)
-{
+static int dwt_enable_rx_timeout(const struct device *dev, uint16_t timeout) {
+	struct dwt_context *ctx = dev->data;
 	uint32_t sys_cfg;
 	uint16_t sys_ctrl = DWT_SYS_CTRL_RXENAB;
 
@@ -570,6 +580,72 @@ static int dwt_enable_rx(const struct device *dev, uint16_t timeout)
 		sys_cfg |= DWT_SYS_CFG_RXWTOE;
 	} else {
 		sys_cfg &= ~DWT_SYS_CFG_RXWTOE;
+	}
+
+	dwt_reg_write_u32(dev, DWT_SYS_CFG_ID, 0, sys_cfg);
+}
+
+/* static int dwt_ranging_rx(const struct device *dev, uint16_t timeout, uint64_t dwt_rx_ts) */
+/* { */
+/* 	struct dwt_context *ctx = dev->data; */
+/* 	uint32_t sys_cfg; */
+/* 	uint16_t sys_ctrl = DWT_SYS_CTRL_RXENAB; */
+
+/* 	sys_cfg = dwt_reg_read_u32(dev, DWT_SYS_CFG_ID, 0); */
+
+/* 	if (timeout != 0) { */
+/* 		dwt_reg_write_u16(dev, DWT_RX_FWTO_ID, DWT_RX_FWTO_OFFSET, */
+/* 				  timeout); */
+/* 		sys_cfg |= DWT_SYS_CFG_RXWTOE; */
+/* 	} else { */
+/* 		sys_cfg &= ~DWT_SYS_CFG_RXWTOE; */
+/* 	} */
+
+/* 	// program delayed receive */
+/* 	if(dwt_rx_ts != 0) { */
+/* 		dwt_reg_write_u32(dev, DWT_DX_TIME_ID, 1, (uint32_t) (dwt_rx_ts >> 8)); */
+/* 		sys_ctrl |= DWT_SYS_CTRL_RXDLYE; */
+/* 	} else { */
+/* 		sys_ctrl &= ~DWT_SYS_CTRL_RXDLYE; */
+/* 	} */
+
+/* 	if (atomic_test_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU)) { */
+/* 		k_sem_reset(&ctx->phy_sem); */
+/* 	} */
+
+/* 	dwt_reg_write_u32(dev, DWT_SYS_CFG_ID, 0, sys_cfg); */
+/* 	dwt_reg_write_u16(dev, DWT_SYS_CTRL_ID, DWT_SYS_CTRL_OFFSET, sys_ctrl); */
+
+/* 	return 0; */
+/* } */
+
+/* timeout time in units of 1.026 microseconds */
+static int dwt_enable_rx(const struct device *dev, uint16_t timeout, uint64_t dwt_rx_ts)
+{
+	struct dwt_context *ctx = dev->data;
+	uint32_t sys_cfg;
+	uint16_t sys_ctrl = DWT_SYS_CTRL_RXENAB;
+
+	sys_cfg = dwt_reg_read_u32(dev, DWT_SYS_CFG_ID, 0);
+
+	if (timeout != 0) {
+		dwt_reg_write_u16(dev, DWT_RX_FWTO_ID, DWT_RX_FWTO_OFFSET,
+				  timeout);
+		sys_cfg |= DWT_SYS_CFG_RXWTOE;
+	} else {
+		sys_cfg &= ~DWT_SYS_CFG_RXWTOE;
+	}
+
+	// program delayed receive
+	if(dwt_rx_ts != 0) {
+		dwt_reg_write_u32(dev, DWT_DX_TIME_ID, 1, (uint32_t) (dwt_rx_ts >> 8));
+		sys_ctrl |= DWT_SYS_CTRL_RXDLYE;
+	} else {
+		sys_ctrl &= ~DWT_SYS_CTRL_RXDLYE;
+	}
+
+	if (atomic_test_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU)) {
+		k_sem_reset(&ctx->phy_sem);
 	}
 
 	dwt_reg_write_u32(dev, DWT_SYS_CFG_ID, 0, sys_cfg);
@@ -590,6 +666,18 @@ static inline void dwt_irq_handle_rx_cca(const struct device *dev)
 			  DWT_SYS_STATUS_ALL_RX_GOOD);
 }
 
+/* static inline void dwt_read_received_frame(const struct device *dev) { */
+/*     uint32_t rx_finfo; */
+/*     uint32_t rx_pacc; */
+/*     uint16_t pkt_len; */
+
+/*     rx_finfo = dwt_reg_read_u32(dev, DWT_RX_FINFO_ID, DWT_RX_FINFO_OFFSET); */
+/*     pkt_len = rx_finfo & DWT_RX_FINFO_RXFLEN_MASK; */
+/*     rx_pacc = (rx_finfo & DWT_RX_FINFO_RXPACC_MASK) >> DWT_RX_FINFO_RXPACC_SHIFT; */
+
+/*     dwt_register_read(dev, DWT_RX_BUFFER_ID, 0, pkt_len, pkt->buffer->data); */
+/* } */
+
 static inline void dwt_irq_handle_rx(const struct device *dev, uint32_t sys_stat)
 {
 	struct dwt_context *ctx = dev->data;
@@ -606,12 +694,11 @@ static inline void dwt_irq_handle_rx(const struct device *dev, uint32_t sys_stat
 	uint8_t *fctrl;
 	int8_t rx_level = INT8_MIN;
 
-	SET_GPIO_HIGH(1);
-
 	LOG_DBG("RX OK event, SYS_STATUS 0x%08x", sys_stat);
 	flags_to_clear = sys_stat & DWT_SYS_STATUS_ALL_RX_GOOD;
 
 	rx_finfo = dwt_reg_read_u32(dev, DWT_RX_FINFO_ID, DWT_RX_FINFO_OFFSET);
+
 	pkt_len = rx_finfo & DWT_RX_FINFO_RXFLEN_MASK;
 	rx_pacc = (rx_finfo & DWT_RX_FINFO_RXPACC_MASK) >>
 		   DWT_RX_FINFO_RXPACC_SHIFT;
@@ -628,6 +715,7 @@ static inline void dwt_irq_handle_rx(const struct device *dev, uint32_t sys_stat
 	}
 
 	dwt_register_read(dev, DWT_RX_BUFFER_ID, 0, pkt_len, pkt->buffer->data);
+
 	dwt_register_read(dev, DWT_RX_FQUAL_ID, 0, sizeof(rx_inf_reg),
 			  (uint8_t *)&rx_inf_reg);
 	net_buf_add(pkt->buffer, pkt_len);
@@ -731,8 +819,17 @@ rx_out_enable_rx:
 		dwt_reg_write_u16(dev, DWT_SYS_CTRL_ID, DWT_SYS_CTRL_OFFSET,
 				  DWT_SYS_CTRL_RXENAB);
 	}
+}
 
-	SET_GPIO_LOW(1);
+static inline void dwt_irq_minimal_rx_handler(const struct device *dev, uint32_t sys_stat)
+{
+	struct dwt_context *ctx = dev->data;
+
+	dwt_reg_write_u32(dev, DWT_SYS_STATUS_ID, 0, sys_stat & DWT_SYS_STATUS_ALL_RX_GOOD);
+
+	ctx->phy_irq_event = DWT_IRQ_RX;
+
+	k_sem_give(&ctx->phy_sem);
 }
 
 static void dwt_irq_handle_tx(const struct device *dev, uint32_t sys_stat)
@@ -742,6 +839,8 @@ static void dwt_irq_handle_tx(const struct device *dev, uint32_t sys_stat)
 	/* Clear TX event bits */
 	dwt_reg_write_u32(dev, DWT_SYS_STATUS_ID, 0,
 			  DWT_SYS_STATUS_ALL_TX);
+
+	ctx->phy_irq_event = DWT_IRQ_TX;
 
 	LOG_DBG("TX confirmed event");
 	k_sem_give(&ctx->phy_sem);
@@ -765,7 +864,13 @@ static void dwt_irq_handle_rxto(const struct device *dev, uint32_t sys_stat)
 		k_sem_give(&ctx->phy_sem);
 		ctx->cca_busy = false;
 	}
+
+	if (atomic_test_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU)) {
+		k_sem_give(&ctx->phy_sem);
+		ctx->phy_irq_event = DWT_IRQ_RX_TIMEOUT;
+	}
 }
+
 
 static void dwt_irq_handle_error(const struct device *dev, uint32_t sys_stat)
 {
@@ -779,27 +884,27 @@ static void dwt_irq_handle_error(const struct device *dev, uint32_t sys_stat)
 	dwt_reset_rfrx(dev);
 
 	if (sys_stat & DWT_SYS_STATUS_RXPHE) {
-		LOG_INF("RX error DWT_SYS_STATUS_RXPHE");
+		LOG_ERR("RX error DWT_SYS_STATUS_RXPHE");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_RXFCE) {
-		LOG_INF("RX error DWT_SYS_STATUS_RXFCE");
+		LOG_ERR("RX error DWT_SYS_STATUS_RXFCE");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_RXRFSL) {
-		LOG_INF("RX error DWT_SYS_STATUS_RXRFSL");
+		LOG_ERR("RX error DWT_SYS_STATUS_RXRFSL");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_RXOVRR) {
-		LOG_INF("RX error DWT_SYS_STATUS_RXOVRR");
+		LOG_ERR("RX error DWT_SYS_STATUS_RXOVRR");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_RXSFDTO) {
-		LOG_INF("RX error DWT_SYS_STATUS_RXSFDTO");
+		LOG_ERR("RX error DWT_SYS_STATUS_RXSFDTO");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_AFFREJ) {
-		LOG_INF("RX error DWT_SYS_STATUS_AFFREJ");
+		LOG_ERR("RX error DWT_SYS_STATUS_AFFREJ");
 	}
 
 	if (atomic_test_bit(&ctx->state, DWT_STATE_CCA)) {
@@ -808,8 +913,13 @@ static void dwt_irq_handle_error(const struct device *dev, uint32_t sys_stat)
 		return;
 	}
 
+	if (atomic_test_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU)) {
+		k_sem_give(&ctx->phy_sem);
+		ctx->phy_irq_event = DWT_IRQ_ERR;
+	}
+
 	if (atomic_test_bit(&ctx->state, DWT_STATE_RX_DEF_ON)) {
-		dwt_enable_rx(dev, 0);
+		dwt_enable_rx(dev, 0, 0);
 	}
 }
 
@@ -822,12 +932,14 @@ static void dwt_irq_work_handler(struct k_work *item)
 
 	k_sem_take(&ctx->dev_lock, K_FOREVER);
 
-	SET_GPIO_HIGH(1);
 	sys_stat = dwt_reg_read_u32(dev, DWT_SYS_STATUS_ID, 0);
-	SET_GPIO_LOW(1);
 
 	if (sys_stat & DWT_SYS_STATUS_RXFCG) {
-		if (atomic_test_bit(&ctx->state, DWT_STATE_CCA)) {
+		// TODO Add here transmission stuff
+
+		if (atomic_test_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU)) {
+			dwt_irq_minimal_rx_handler(dev, sys_stat);
+		} else if (atomic_test_bit(&ctx->state, DWT_STATE_CCA)) {
 			dwt_irq_handle_rx_cca(dev);
 		} else {
 			dwt_irq_handle_rx(dev, sys_stat);
@@ -854,13 +966,10 @@ static void dwt_gpio_callback(const struct device *dev,
 {
 	struct dwt_context *ctx = CONTAINER_OF(cb, struct dwt_context, gpio_cb);
 
-	SET_GPIO_HIGH(1);
-
 	LOG_DBG("IRQ callback triggered %p", ctx);
-	k_work_submit(&ctx->irq_cb_work);
+	/* k_work_submit(&ctx->irq_cb_work); */
 
-	SET_GPIO_LOW(1);
-	// k_work_submit_to_queue(&dwt_work_queue, &ctx->irq_cb_work);
+	k_work_submit_to_queue(&dwt_work_queue, &ctx->irq_cb_work);
 }
 
 static enum ieee802154_hw_caps dwt_get_capabilities(const struct device *dev)
@@ -895,7 +1004,7 @@ static int dwt_cca(const struct device *dev)
 	dwt_disable_txrx(dev);
 	LOG_DBG("CCA duration %u us", cca_dur);
 
-	dwt_enable_rx(dev, cca_dur);
+	dwt_enable_rx(dev, cca_dur, 0);
 	k_sem_give(&ctx->dev_lock);
 
 	k_sem_take(&ctx->phy_sem, K_FOREVER);
@@ -904,7 +1013,7 @@ static int dwt_cca(const struct device *dev)
 	atomic_clear_bit(&ctx->state, DWT_STATE_CCA);
 	if (atomic_test_bit(&ctx->state, DWT_STATE_RX_DEF_ON)) {
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
-		dwt_enable_rx(dev, 0);
+		dwt_enable_rx(dev, 0, 0);
 		k_sem_give(&ctx->dev_lock);
 	}
 
@@ -941,7 +1050,7 @@ static int dwt_set_channel(const struct device *dev, uint16_t channel)
 	dwt_configure_rf_phy(dev);
 
 	if (atomic_test_bit(&ctx->state, DWT_STATE_RX_DEF_ON)) {
-		dwt_enable_rx(dev, 0);
+		dwt_enable_rx(dev, 0, 0);
 	}
 
 	k_sem_give(&ctx->dev_lock);
@@ -1022,34 +1131,92 @@ static int dwt_set_power(const struct device *dev, int16_t dbm)
 	return 0;
 }
 
+#define DWT_TS_TO_US(X) (((X)*15650)/1000000000)
+#define DWT_TS_MASK (0xFFFFFFFFFF)
+#define UUS_TO_DWT_TS(X) (((uint64_t)X)*(uint64_t)65536)
+
+static inline int setup_tx_frame(const struct device *dev, const uint8_t *data, uint8_t len) {
+	uint32_t tx_fctrl;
+
+	LOG_DBG("Setting up TX Frame");
+
+	/*
+	 * See "3 Message Transmission" in DW1000 User Manual for
+	 * more details about transmission configuration.
+	 */
+	if (dwt_register_write(dev, DWT_TX_BUFFER_ID, 0, len, data)) {
+		LOG_ERR("Failed to write TX data");
+		return -EIO;
+	}
+
+	tx_fctrl = dwt_reg_read_u32(dev, DWT_TX_FCTRL_ID, 0);
+	/* Clear TX buffer index offset, frame length, and length extension */
+	tx_fctrl &= ~(DWT_TX_FCTRL_TFLEN_MASK | DWT_TX_FCTRL_TFLE_MASK |
+		DWT_TX_FCTRL_TXBOFFS_MASK);
+	/* Set frame length and ranging flag */
+	tx_fctrl |= (len + DWT_FCS_LENGTH) & DWT_TX_FCTRL_TFLEN_MASK;
+	tx_fctrl |= DWT_TX_FCTRL_TR;
+
+	dwt_reg_write_u32(dev, DWT_TX_FCTRL_ID, 0, tx_fctrl);
+	/* k_sem_give(&ctx->dev_lock); */
+
+	return 0;
+}
+
+static inline int kickoff_tx(const struct device *dev, uint64_t dwt_tx_ts) {
+	struct dwt_context *ctx = dev->data;
+
+	/* k_sem_take(&ctx->dev_lock, K_FOREVER); */
+	uint8_t sys_ctrl = DWT_SYS_CTRL_TXSTRT;
+
+	if(dwt_tx_ts > 0) {
+		sys_ctrl |= DWT_SYS_CTRL_TXDLYS;
+		dwt_reg_write_u32(dev, DWT_DX_TIME_ID, 1, (uint32_t) (dwt_tx_ts >> 8));
+	}
+
+	// we reset the phy semaphore back to 0. The tx interrupt routine will clear it again later.
+	k_sem_reset(&ctx->phy_sem);
+	dwt_reg_write_u8(dev, DWT_SYS_CTRL_ID, DWT_SYS_CTRL_OFFSET, sys_ctrl);
+	/* k_sem_give(&ctx->dev_lock); */
+
+	return 0;
+}
+
+static inline int wait_for_phy(const struct device *dev) {
+	struct dwt_context *ctx = dev->data;
+
+
+	k_sem_take(&ctx->phy_sem, K_FOREVER);
+
+	uint8_t irq_state = ctx->phy_irq_event;
+	ctx->phy_irq_event = DWT_IRQ_NONE;
+
+	return irq_state;
+}
+
+
+
 static int dwt_tx(const struct device *dev, enum ieee802154_tx_mode tx_mode,
-		  struct net_pkt *pkt, struct net_buf *frag)
+	struct net_pkt *pkt, struct net_buf *frag)
 {
 	struct dwt_context *ctx = dev->data;
 	size_t len = frag->len;
 	uint32_t tx_time = 0;
 	uint64_t tmp_fs;
-	uint32_t tx_fctrl;
-	uint8_t sys_ctrl = DWT_SYS_CTRL_TXSTRT;
-
-	uint32_t tx1, tx2, tx3, tx4, tx5;
-
-	tx1 = k_cycle_get_32();
-
-	SET_GPIO_HIGH(0);
 
 	if (atomic_test_and_set_bit(&ctx->state, DWT_STATE_TX)) {
 		LOG_ERR("Transceiver busy");
 		return -EBUSY;
 	}
 
-	k_sem_reset(&ctx->phy_sem);
 	k_sem_take(&ctx->dev_lock, K_FOREVER);
 
+	LOG_HEXDUMP_DBG(frag->data, len, "TX buffer:");
+
 	switch (tx_mode) {
-	case IEEE802154_TX_MODE_DIRECT:
+        case IEEE802154_TX_MODE_DIRECT:
 		break;
-	case IEEE802154_TX_MODE_TXTIME:
+        case IEEE802154_TX_MODE_TXTIME:
 		/*
 		 * tx_time is the high 32-bit of the 40-bit system
 		 * time value at which to send the message.
@@ -1063,66 +1230,26 @@ static int dwt_tx(const struct device *dev, enum ieee802154_tx_mode tx_mode,
 			tx_time = (tmp_fs / DWT_TS_TIME_UNITS_FS) >> 8;
 		}
 
-		sys_ctrl |= DWT_SYS_CTRL_TXDLYS;
-		/* DX_TIME is 40-bit register */
-		dwt_reg_write_u32(dev, DWT_DX_TIME_ID, 1, tx_time);
-
 		LOG_DBG("ntx hi32 %x", tx_time);
 		LOG_DBG("sys hi32 %x",
 			dwt_reg_read_u32(dev, DWT_SYS_TIME_ID, 1));
+
 		break;
-	default:
+        default:
 		LOG_ERR("TX mode %d not supported", tx_mode);
 		goto error;
 	}
 
-	LOG_HEXDUMP_DBG(frag->data, len, "TX buffer:");
-
-	tx2 = k_cycle_get_32();
-
-
-	/*
-	 * See "3 Message Transmission" in DW1000 User Manual for
-	 * more details about transmission configuration.
-	 */
-	if (dwt_register_write(dev, DWT_TX_BUFFER_ID, 0, len, frag->data)) {
-		LOG_ERR("Failed to write TX data");
-		goto error;
-	}
-
-	tx_fctrl = dwt_reg_read_u32(dev, DWT_TX_FCTRL_ID, 0);
-	/* Clear TX buffer index offset, frame length, and length extension */
-	tx_fctrl &= ~(DWT_TX_FCTRL_TFLEN_MASK | DWT_TX_FCTRL_TFLE_MASK |
-		      DWT_TX_FCTRL_TXBOFFS_MASK);
-	/* Set frame length and ranging flag */
-	tx_fctrl |= (len + DWT_FCS_LENGTH) & DWT_TX_FCTRL_TFLEN_MASK;
-	tx_fctrl |= DWT_TX_FCTRL_TR;
-	/* Update Transmit Frame Control register */
-	dwt_reg_write_u32(dev, DWT_TX_FCTRL_ID, 0, tx_fctrl);
+	// setting up tx buffer, this operations takes up much of this function
+	setup_tx_frame(dev, frag->data, len);
 
 	dwt_disable_txrx(dev);
-	SET_GPIO_LOW(0);
-	SET_GPIO_HIGH(0);
 
-	/* Begin transmission */
-	dwt_reg_write_u8(dev, DWT_SYS_CTRL_ID, DWT_SYS_CTRL_OFFSET, sys_ctrl);
-
-	if (sys_ctrl & DWT_SYS_CTRL_TXDLYS) {
-		uint32_t sys_stat = dwt_reg_read_u32(dev, DWT_SYS_STATUS_ID, 0);
-
-		if (sys_stat & DWT_SYS_STATUS_HPDWARN) {
-			// LOG_WRN("Half Period Delay Warning Current: %llu", dwt_system_ts(dev));
-			uint64_t planned_us = dwt_short_ts_to_fs(tx_time) / 1000000000U;
-			uint64_t current_us = dwt_ts_to_fs(dwt_system_ts(dev)) / 1000000000U;
-			LOG_WRN("Half Period Delay Warning (planned: %llu, current: %llu)",
-				planned_us, current_us);
-		}
-	}
+	kickoff_tx(dev, tx_time << 8);
 
 	k_sem_give(&ctx->dev_lock);
-	/* Wait for the TX confirmed event */
-	k_sem_take(&ctx->phy_sem, K_FOREVER);
-	SET_GPIO_LOW(0);
+
+	wait_for_phy(dev);
 
 	if (IS_ENABLED(CONFIG_NET_PKT_TIMESTAMP)) {
 		uint8_t ts_buf[sizeof(uint64_t)] = {0};
@@ -1145,7 +1272,7 @@ static int dwt_tx(const struct device *dev, enum ieee802154_tx_mode tx_mode,
 
 	if (atomic_test_bit(&ctx->state, DWT_STATE_RX_DEF_ON)) {
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
-		dwt_enable_rx(dev, 0);
+		dwt_enable_rx(dev, 0, 0);
 		k_sem_give(&ctx->dev_lock);
 	}
 
@@ -1375,10 +1502,10 @@ static int dwt_start(const struct device *dev)
 
 	/* Re-enable RX after packet reception */
 	atomic_set_bit(&ctx->state, DWT_STATE_RX_DEF_ON);
-	dwt_enable_rx(dev, 0);
+	dwt_enable_rx(dev, 0, 0);
 	k_sem_give(&ctx->dev_lock);
 
-	LOG_INF("Started %p", dev);
+	LOG_WRN("Started %p", dev);
 
 	return 0;
 }
@@ -1475,9 +1602,9 @@ inline uint64_t dwt_system_ts(const struct device *dev)
 	uint8_t ts_buf[sizeof(uint64_t)] = {0};
 
 	// TODO: Should we lock?!
-	// k_sem_take(&ctx->dev_lock, K_FOREVER);
+	/* k_sem_take(&ctx->dev_lock, K_FOREVER); */
 	dwt_register_read(dev, DWT_SYS_TIME_ID, DWT_SYS_TIME_OFFSET, DWT_SYS_TIME_LEN, ts_buf);
-	// k_sem_give(&ctx->dev_lock);
+	/* k_sem_give(&ctx->dev_lock); */
 	return sys_get_le64(ts_buf);
 }
 
@@ -2208,6 +2335,189 @@ static void dwt_iface_api_init(struct net_if *iface)
 	ieee802154_init(iface);
 
 	LOG_INF("Iface initialized");
+}
+
+// for now only used to read rx timestamp
+static inline uint64_t dwt_read_rx_timestamp(const struct device *dev) {
+	struct dwt_rx_info_regs rx_inf_reg;
+	uint8_t ts_buf[sizeof(uint64_t)] = {0};
+
+	dwt_register_read(dev, DWT_RX_FQUAL_ID, 0, sizeof(rx_inf_reg),
+			  (uint8_t *)&rx_inf_reg);
+
+	memcpy(ts_buf, rx_inf_reg.rx_time, DWT_RX_TIME_RX_STAMP_LEN);
+
+	return sys_get_le64(ts_buf);
+}
+
+static inline uint64_t dwt_read_tx_timestamp(const struct device *dev) {
+	struct dwt_rx_info_regs rx_inf_reg;
+	uint8_t ts_buf[sizeof(uint64_t)] = {0};
+
+	dwt_register_read(dev, DWT_TX_TIME_ID,
+				  DWT_TX_TIME_TX_STAMP_OFFSET,
+				  DWT_TX_TIME_TX_STAMP_LEN,
+				  ts_buf);
+
+	return sys_get_le64(ts_buf);
+}
+
+struct mtm_ranging_setup_struct {
+	uint8_t position;
+	uint64_t setup_tx_frame_duration;
+	uint64_t slot_length;
+	uint64_t phy_action_delay;
+	uint64_t phy_activate_rx_delay;
+	uint16_t frame_timeout_period;
+	uint64_t initiation_delay;
+} mtm_ranging_conf = {
+	.slot_length = UUS_TO_DWT_TS(2000), // measured 270
+	.setup_tx_frame_duration = UUS_TO_DWT_TS(270), // measured 270
+	.phy_action_delay = UUS_TO_DWT_TS(100), // measured 89
+	.phy_activate_rx_delay = UUS_TO_DWT_TS(100),
+	.initiation_delay = UUS_TO_DWT_TS(1000), // round start is measured by RFRAME marker, so add about 500us for now
+	.frame_timeout_period = 300
+};
+
+int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
+	struct dwt_context *ctx = dev->data;
+	LOG_WRN("Ranging Start");
+
+	SET_GPIO_LOW(1);
+	if (atomic_test_and_set_bit(&ctx->state, DWT_STATE_TX)) {
+		LOG_ERR("Transceiver busy");
+		return -EBUSY;
+	}
+
+	// reset to idle state and disable auto rx enabling
+	atomic_set_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU);
+	atomic_clear_bit(&ctx->state, DWT_STATE_RX_DEF_ON);
+
+	SET_GPIO_HIGH(1);
+	k_sem_take(&ctx->dev_lock, K_FOREVER);
+	dwt_disable_txrx(dev);
+	dwt_set_frame_filter(dev, 0, 0);
+	k_sem_give(&ctx->dev_lock);
+	SET_GPIO_LOW(1);
+
+	// --- Round Initiation ---
+	uint64_t round_start_dw_ts;
+	uint8_t irq_state;
+
+	SET_GPIO_HIGH(1);
+	if (!pos) {
+		k_sem_take(&ctx->dev_lock, K_FOREVER);
+
+		uint8_t buf[20] = {0xDE, 0xCA, 0x1};
+
+		setup_tx_frame(dev, buf, 20);
+		kickoff_tx(dev, 0);
+
+		k_sem_give(&ctx->dev_lock);
+
+		irq_state = wait_for_phy(dev);
+
+		k_sem_take(&ctx->dev_lock, K_FOREVER);
+		round_start_dw_ts = dwt_read_tx_timestamp(dev);
+		k_sem_give(&ctx->dev_lock);
+	} else {
+		k_sem_take(&ctx->dev_lock, K_FOREVER);
+		dwt_enable_rx(dev, 0, 0);
+		k_sem_give(&ctx->dev_lock);
+
+		irq_state = wait_for_phy(dev);
+
+		k_sem_take(&ctx->dev_lock, K_FOREVER);
+		round_start_dw_ts = dwt_read_rx_timestamp(dev);
+
+                // read received packet
+		uint32_t rx_finfo;
+		uint16_t pkt_len;
+		rx_finfo = dwt_reg_read_u32(dev, DWT_RX_FINFO_ID, DWT_RX_FINFO_OFFSET);
+		pkt_len = rx_finfo & DWT_RX_FINFO_RXFLEN_MASK;
+
+		uint8_t buf[pkt_len];
+
+		dwt_register_read(dev, DWT_RX_BUFFER_ID, 0, pkt_len, buf);
+
+		if(buf[0] != 0xDE || buf[1] != 0xCA || buf[2] != 0x1) {
+			LOG_ERR("Invalid packet received");
+			k_sem_give(&ctx->dev_lock);
+			goto cleanup;
+		}
+
+		k_sem_give(&ctx->dev_lock);
+	}
+	SET_GPIO_LOW(1);
+
+	if(irq_state == DWT_IRQ_ERR) {
+		LOG_ERR("Error");
+		goto cleanup;
+	}
+
+	// --- Iterate through Phases ---
+	uint8_t current_phase = 0;
+	uint8_t round_length = 2; // put 4 for now so the round times out
+
+	while(current_phase < 1) {
+		uint8_t slots = 0;
+		uint8_t buf[125] = {0xDE, 0xCA, 0x00};
+
+		// --- Setup Transmision buffers on round start ---
+
+		k_sem_take(&ctx->dev_lock, K_FOREVER);
+		setup_tx_frame(dev, buf, 125);
+		k_sem_give(&ctx->dev_lock);
+
+		// --- Begin transmission/reception loop ---
+		do {
+			// ATTENCIONE! We do not handle overflow yet.
+			uint64_t phy_delayed_action_ts = round_start_dw_ts
+				+ mtm_ranging_conf.initiation_delay
+				+ mtm_ranging_conf.setup_tx_frame_duration
+				+ mtm_ranging_conf.phy_action_delay
+				+ mtm_ranging_conf.slot_length * slots;
+
+			// --- Decide the PHY action to execute
+			k_sem_take(&ctx->dev_lock, K_FOREVER);
+			if(slots == pos) {
+				// --- create scheduled transmission at slot_time
+				kickoff_tx(dev, (phy_delayed_action_ts + mtm_ranging_conf.phy_activate_rx_delay) & DWT_TS_MASK );
+			} else {
+				// --- create scheduled reception at slot_time
+				dwt_enable_rx(dev, mtm_ranging_conf.frame_timeout_period, phy_delayed_action_ts & DWT_TS_MASK );
+			}
+			k_sem_give(&ctx->dev_lock);
+
+			// --- Let the PHY do its thing and continue work on the MCU
+
+			// --- Join with PHY
+			irq_state = wait_for_phy(dev);
+
+			if(irq_state == DWT_IRQ_RX_TIMEOUT) {
+				LOG_WRN("RXTO");
+				goto cleanup;
+			} else if(irq_state == DWT_IRQ_RX) {
+				LOG_WRN("Rx");
+			} else if(irq_state == DWT_IRQ_TX) {
+				LOG_WRN("Tx");
+			} else if(irq_state == DWT_IRQ_ERR) {
+				LOG_ERR("Error");
+				goto cleanup;
+			}
+
+			slots++;
+		} while(slots < round_length);
+
+		current_phase++;
+	}
+
+	LOG_WRN("Ranging finished");
+
+  cleanup:
+	atomic_clear_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU);
+	atomic_set_bit(&ctx->state, DWT_STATE_RX_DEF_ON);
+	atomic_clear_bit(&ctx->state, DWT_STATE_TX);
 }
 
 static const struct ieee802154_radio_api dwt_radio_api = {

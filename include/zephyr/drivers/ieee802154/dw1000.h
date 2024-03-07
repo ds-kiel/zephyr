@@ -25,6 +25,9 @@ void dwt_set_delayed_tx_short_ts(const struct device *dev, uint32_t short_ts);
  */
 uint64_t dwt_plan_delayed_tx(const struct device *dev, uint64_t uus_delay);
 
+
+int dwt_mtm_ranging(const struct device *dev, uint8_t pos);
+
 void dwt_set_antenna_delay_rx(const struct device *dev, uint16_t rx_delay_ts);
 void dwt_set_antenna_delay_tx(const struct device *dev, uint16_t tx_delay_ts);
 
