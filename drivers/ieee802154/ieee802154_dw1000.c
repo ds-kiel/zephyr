@@ -567,7 +567,7 @@ static void dwt_disable_txrx(const struct device *dev)
 	dwt_setup_int(dev, true);
 }
 
-static int dwt_enable_rx_timeout(const struct device *dev, uint16_t timeout) {
+static void dwt_setup_rx_timeout(const struct device *dev, uint16_t timeout) {
 	struct dwt_context *ctx = dev->data;
 	uint32_t sys_cfg;
 	uint16_t sys_ctrl = DWT_SYS_CTRL_RXENAB;
@@ -585,39 +585,25 @@ static int dwt_enable_rx_timeout(const struct device *dev, uint16_t timeout) {
 	dwt_reg_write_u32(dev, DWT_SYS_CFG_ID, 0, sys_cfg);
 }
 
-/* static int dwt_ranging_rx(const struct device *dev, uint16_t timeout, uint64_t dwt_rx_ts) */
-/* { */
-/* 	struct dwt_context *ctx = dev->data; */
-/* 	uint32_t sys_cfg; */
-/* 	uint16_t sys_ctrl = DWT_SYS_CTRL_RXENAB; */
+static inline void dwt_fast_enable_rx(const struct device *dev, uint64_t dwt_rx_ts)
+{
+	struct dwt_context *ctx = dev->data;
+	uint16_t sys_ctrl = DWT_SYS_CTRL_RXENAB;
 
-/* 	sys_cfg = dwt_reg_read_u32(dev, DWT_SYS_CFG_ID, 0); */
+	// program delayed receive
+	if(dwt_rx_ts != 0) {
+		dwt_reg_write_u32(dev, DWT_DX_TIME_ID, 1, (uint32_t) (dwt_rx_ts >> 8));
+		sys_ctrl |= DWT_SYS_CTRL_RXDLYE;
+	} else {
+		sys_ctrl &= ~DWT_SYS_CTRL_RXDLYE;
+	}
 
-/* 	if (timeout != 0) { */
-/* 		dwt_reg_write_u16(dev, DWT_RX_FWTO_ID, DWT_RX_FWTO_OFFSET, */
-/* 				  timeout); */
-/* 		sys_cfg |= DWT_SYS_CFG_RXWTOE; */
-/* 	} else { */
-/* 		sys_cfg &= ~DWT_SYS_CFG_RXWTOE; */
-/* 	} */
+	if (atomic_test_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU)) {
+		k_sem_reset(&ctx->phy_sem);
+	}
 
-/* 	// program delayed receive */
-/* 	if(dwt_rx_ts != 0) { */
-/* 		dwt_reg_write_u32(dev, DWT_DX_TIME_ID, 1, (uint32_t) (dwt_rx_ts >> 8)); */
-/* 		sys_ctrl |= DWT_SYS_CTRL_RXDLYE; */
-/* 	} else { */
-/* 		sys_ctrl &= ~DWT_SYS_CTRL_RXDLYE; */
-/* 	} */
-
-/* 	if (atomic_test_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU)) { */
-/* 		k_sem_reset(&ctx->phy_sem); */
-/* 	} */
-
-/* 	dwt_reg_write_u32(dev, DWT_SYS_CFG_ID, 0, sys_cfg); */
-/* 	dwt_reg_write_u16(dev, DWT_SYS_CTRL_ID, DWT_SYS_CTRL_OFFSET, sys_ctrl); */
-
-/* 	return 0; */
-/* } */
+	dwt_reg_write_u16(dev, DWT_SYS_CTRL_ID, DWT_SYS_CTRL_OFFSET, sys_ctrl);
+}
 
 /* timeout time in units of 1.026 microseconds */
 static int dwt_enable_rx(const struct device *dev, uint16_t timeout, uint64_t dwt_rx_ts)
@@ -884,27 +870,27 @@ static void dwt_irq_handle_error(const struct device *dev, uint32_t sys_stat)
 	dwt_reset_rfrx(dev);
 
 	if (sys_stat & DWT_SYS_STATUS_RXPHE) {
-		LOG_ERR("RX error DWT_SYS_STATUS_RXPHE");
+		LOG_INF("RX error DWT_SYS_STATUS_RXPHE");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_RXFCE) {
-		LOG_ERR("RX error DWT_SYS_STATUS_RXFCE");
+		LOG_INF("RX error DWT_SYS_STATUS_RXFCE");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_RXRFSL) {
-		LOG_ERR("RX error DWT_SYS_STATUS_RXRFSL");
+		LOG_INF("RX error DWT_SYS_STATUS_RXRFSL");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_RXOVRR) {
-		LOG_ERR("RX error DWT_SYS_STATUS_RXOVRR");
+		LOG_INF("RX error DWT_SYS_STATUS_RXOVRR");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_RXSFDTO) {
-		LOG_ERR("RX error DWT_SYS_STATUS_RXSFDTO");
+		LOG_INF("RX error DWT_SYS_STATUS_RXSFDTO");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_AFFREJ) {
-		LOG_ERR("RX error DWT_SYS_STATUS_AFFREJ");
+		LOG_INF("RX error DWT_SYS_STATUS_AFFREJ");
 	}
 
 	if (atomic_test_bit(&ctx->state, DWT_STATE_CCA)) {
@@ -1163,7 +1149,7 @@ static inline int setup_tx_frame(const struct device *dev, const uint8_t *data, 
 	return 0;
 }
 
-static inline int kickoff_tx(const struct device *dev, uint64_t dwt_tx_ts) {
+static inline int dwt_fast_enable_tx(const struct device *dev, uint64_t dwt_tx_ts) {
 	struct dwt_context *ctx = dev->data;
 
 	/* k_sem_take(&ctx->dev_lock, K_FOREVER); */
@@ -1245,7 +1231,7 @@ static int dwt_tx(const struct device *dev, enum ieee802154_tx_mode tx_mode,
 
 	dwt_disable_txrx(dev);
 
-	kickoff_tx(dev, tx_time << 8);
+	dwt_fast_enable_tx(dev, tx_time << 8);
 
 	k_sem_give(&ctx->dev_lock);
 
@@ -2371,12 +2357,16 @@ struct mtm_ranging_setup_struct {
 	uint16_t frame_timeout_period;
 	uint64_t initiation_delay;
 } mtm_ranging_conf = {
-	.slot_length = UUS_TO_DWT_TS(2000), // measured 270
-	.setup_tx_frame_duration = UUS_TO_DWT_TS(270), // measured 270
-	.phy_action_delay = UUS_TO_DWT_TS(100), // measured 89
-	.phy_activate_rx_delay = UUS_TO_DWT_TS(100),
+	.slot_length = UUS_TO_DWT_TS(420),
+	/* .setup_tx_frame_duration = UUS_TO_DWT_TS(270), // measured 270 */
+	/* .phy_action_delay = UUS_TO_DWT_TS(50), // measured 89 */
+
+	/* when programming the delayed transmit, the transceiver will begin transmitting symbols earlier to meet the programmed */
+	/* delayed transmit timestamp. This we have to account for when programming the transmission! Also the receiver need 16us to start */
+	/* receiving preamble symbols */
+	.phy_activate_rx_delay = UUS_TO_DWT_TS(128 + 16),
 	.initiation_delay = UUS_TO_DWT_TS(1000), // round start is measured by RFRAME marker, so add about 500us for now
-	.frame_timeout_period = 300
+	.frame_timeout_period = 400
 };
 
 int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
@@ -2411,7 +2401,7 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 		uint8_t buf[20] = {0xDE, 0xCA, 0x1};
 
 		setup_tx_frame(dev, buf, 20);
-		kickoff_tx(dev, 0);
+		dwt_fast_enable_tx(dev, 0);
 
 		k_sem_give(&ctx->dev_lock);
 
@@ -2459,33 +2449,34 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 	uint8_t current_phase = 0;
 	uint8_t round_length = 2; // put 4 for now so the round times out
 
-	while(current_phase < 1) {
+	uint64_t slot_start_ts = round_start_dw_ts
+		+ mtm_ranging_conf.initiation_delay;
+
+	// for our ranging round we want to use frame timeouts, so we set them here once
+	k_sem_take(&ctx->dev_lock, K_FOREVER);
+	dwt_setup_rx_timeout(dev, mtm_ranging_conf.frame_timeout_period);
+	k_sem_give(&ctx->dev_lock);
+
+	while(current_phase < 1) { // TODO --- other phases
 		uint8_t slots = 0;
-		uint8_t buf[125] = {0xDE, 0xCA, 0x00};
+		static uint8_t buf[125] = {0xDE, 0xCA, 0x00};
 
 		// --- Setup Transmision buffers on round start ---
 
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
-		setup_tx_frame(dev, buf, 125);
+		setup_tx_frame(dev, buf, 120);
 		k_sem_give(&ctx->dev_lock);
 
 		// --- Begin transmission/reception loop ---
 		do {
-			// ATTENCIONE! We do not handle overflow yet.
-			uint64_t phy_delayed_action_ts = round_start_dw_ts
-				+ mtm_ranging_conf.initiation_delay
-				+ mtm_ranging_conf.setup_tx_frame_duration
-				+ mtm_ranging_conf.phy_action_delay
-				+ mtm_ranging_conf.slot_length * slots;
-
 			// --- Decide the PHY action to execute
 			k_sem_take(&ctx->dev_lock, K_FOREVER);
 			if(slots == pos) {
 				// --- create scheduled transmission at slot_time
-				kickoff_tx(dev, (phy_delayed_action_ts + mtm_ranging_conf.phy_activate_rx_delay) & DWT_TS_MASK );
+				dwt_fast_enable_tx(dev, (slot_start_ts + mtm_ranging_conf.phy_activate_rx_delay) & DWT_TS_MASK );
 			} else {
 				// --- create scheduled reception at slot_time
-				dwt_enable_rx(dev, mtm_ranging_conf.frame_timeout_period, phy_delayed_action_ts & DWT_TS_MASK );
+				dwt_fast_enable_rx(dev, slot_start_ts & DWT_TS_MASK );
 			}
 			k_sem_give(&ctx->dev_lock);
 
@@ -2498,13 +2489,15 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 				LOG_WRN("RXTO");
 				goto cleanup;
 			} else if(irq_state == DWT_IRQ_RX) {
-				LOG_WRN("Rx");
+				/* LOG_WRN("Rx"); */
 			} else if(irq_state == DWT_IRQ_TX) {
-				LOG_WRN("Tx");
+				/* LOG_WRN("Tx"); */
 			} else if(irq_state == DWT_IRQ_ERR) {
-				LOG_ERR("Error");
+				/* LOG_ERR("Error"); */
 				goto cleanup;
 			}
+
+			slot_start_ts += mtm_ranging_conf.slot_length;
 
 			slots++;
 		} while(slots < round_length);
