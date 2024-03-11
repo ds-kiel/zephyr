@@ -2466,7 +2466,7 @@ struct mtm_ranging_setup_struct {
 
 	.slot_length = UUS_TO_DWT_TS(450), // smallest so far 420
 	.phy_activate_rx_delay = UUS_TO_DWT_TS(128 + 16),
-	.initiation_delay = UUS_TO_DWT_TS(1000), // round start is measured by RFRAME marker, so add about 500us for now
+	.initiation_delay = UUS_TO_DWT_TS(600), // round start is measured by RFRAME marker, so add about 500us for now
 	.frame_timeout_period = 400
 };
 
@@ -2474,7 +2474,8 @@ struct mtm_ranging_setup_struct {
 int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 	struct dwt_context *ctx = dev->data;
 	LOG_WRN("Ranging Start");
-	SET_GPIO_HIGH(0);
+	SET_GPIO_LOW(0);
+	SET_GPIO_LOW(1);
 
 	// reuse tx state here to prevent multiple ranging rounds from being started
 	if (atomic_test_and_set_bit(&ctx->state, DWT_STATE_TX)) {
@@ -2489,7 +2490,7 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 	k_sem_take(&ctx->dev_lock, K_FOREVER);
 	dwt_disable_txrx(dev);
 	dwt_set_frame_filter(dev, 0, 0);
-	dwt_double_buffering_align(dev);
+	dwt_double_buffering_align(dev); // for the following execution we require that host and receiver side are aligned
 	k_sem_give(&ctx->dev_lock);
 
 	// --- Round Initiation ---
@@ -2499,9 +2500,9 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 	if (!pos) {
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
 
-		uint8_t buf[20] = {0xDE, 0xCA, 0x1};
+		uint8_t buf[3] = {0xDE, 0xCA, 0x1};
 
-		setup_tx_frame(dev, buf, 20);
+		setup_tx_frame(dev, buf, 3);
 		dwt_fast_enable_tx(dev, 0);
 
 		k_sem_give(&ctx->dev_lock);
@@ -2538,14 +2539,13 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 				LOG_ERR("Invalid packet received");
 				k_sem_give(&ctx->dev_lock);
 				goto cleanup;
-			} else {
-				LOG_WRN("Init Frame");
 			}
+
+			k_sem_give(&ctx->dev_lock);
 		} else {
 			goto cleanup;
 		}
 
-		k_sem_give(&ctx->dev_lock);
 	}
 
 	if(irq_state == DWT_IRQ_ERR) {
@@ -2553,9 +2553,11 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 		goto cleanup;
 	}
 
+	SET_GPIO_HIGH(1);
+
 	// --- Iterate through Phases ---
 	uint8_t current_phase = 0;
-	uint8_t round_length = 2; // put 4 for now so the round times out
+	uint8_t round_length = 5;
 
 	uint64_t slot_start_ts = round_start_dw_ts
 		+ mtm_ranging_conf.initiation_delay;
@@ -2568,16 +2570,19 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 	while(current_phase < 1) { // TODO --- other phases
 		uint8_t slots = 0;
 		uint8_t buf[120] = {0xDE, 0xCA, 0x00};
+		uint64_t rx_timestamps[round_length];
 		uint8_t got_packet = 0;
+
+		memset(rx_timestamps, 0, sizeof(rx_timestamps));
 
 		// --- Setup Transmision buffers on round start ---
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
 		setup_tx_frame(dev, buf, 120);
 		k_sem_give(&ctx->dev_lock);
 
+		SET_GPIO_LOW(1);
 		// --- Begin transmission/reception loop ---
 		do {
-			SET_GPIO_HIGH(1);
 			// --- Decide the PHY action to execute
 			k_sem_take(&ctx->dev_lock, K_FOREVER);
 
@@ -2593,18 +2598,23 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 
 			// --- Let the PHY do its thing and continue work on the MCU
 			if(got_packet) {
+				SET_GPIO_HIGH(0);
 				uint32_t rx_finfo;
 				uint16_t pkt_len;
+
 				rx_finfo = dwt_reg_read_u32(dev, DWT_RX_FINFO_ID, DWT_RX_FINFO_OFFSET);
 				pkt_len = rx_finfo & DWT_RX_FINFO_RXFLEN_MASK;
 				uint8_t rx_buf[pkt_len];
+
 				dwt_register_read(dev, DWT_RX_BUFFER_ID, 0, pkt_len, rx_buf);
+				rx_timestamps[slots-1] = dwt_read_rx_timestamp(dev);
 
 				if(rx_buf[0] != 0xDE) {
 					LOG_ERR("Invalid packet received");
 				}
 
 				dwt_switch_buffers(dev);
+				SET_GPIO_LOW(0);
 
 				got_packet = 0;
 			}
@@ -2630,7 +2640,6 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 			slot_start_ts += mtm_ranging_conf.slot_length;
 
 			slots++;
-			SET_GPIO_LOW(1);
 		} while(slots < round_length + 1); // We add one more slot for processing the last received frame.
 
 		current_phase++;
@@ -2645,6 +2654,7 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 	atomic_clear_bit(&ctx->state, DWT_STATE_TX);
 
 	SET_GPIO_LOW(0);
+	SET_GPIO_LOW(1);
 }
 
 static const struct ieee802154_radio_api dwt_radio_api = {
