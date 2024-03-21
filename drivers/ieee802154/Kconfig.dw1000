@@ -35,4 +35,12 @@ config IEEE802154_DW1000_INIT_PRIO
 	  be ready first (and sometime gpio should be the very first as spi
 	  might need it too). And of course it has to start before the net stack.
 
+config IEEE802154_DW1000_OTP_ANTENNA_DELAY
+	bool "Use OTP antenna delay"
+	default y
+	help
+	  Use the OTP antenna delay value. If this option is enabled, the
+	  antenna delay value will be read from the OTP memory. Otherwise,
+	  the antenna delay value will be set to the default value of 16450.
+
 endif

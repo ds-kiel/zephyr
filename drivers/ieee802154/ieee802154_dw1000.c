@@ -17,6 +17,8 @@ LOG_MODULE_REGISTER(dw1000, LOG_LEVEL_INF);
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/net_pkt.h>
 
+#include <zephyr/sys/slist.h>
+#include <zephyr/sys/iterable_sections.h>
 #include <zephyr/sys/byteorder.h>
 #include <string.h>
 #include <zephyr/random/random.h>
@@ -228,6 +230,7 @@ struct dwt_context {
 	uint16_t sleep_mode;
 	uint8_t mac_addr[8];
 
+	uint16_t rx_ant_dly, tx_ant_dly;
 	bool delayed_tx_short_ts_set;
 	uint32_t delayed_tx_short_ts;
 
@@ -912,27 +915,27 @@ static void dwt_irq_handle_error(const struct device *dev, uint32_t sys_stat)
 	dwt_reset_rfrx(dev);
 
 	if (sys_stat & DWT_SYS_STATUS_RXPHE) {
-		LOG_ERR("RX error DWT_SYS_STATUS_RXPHE");
+		LOG_INF("RX error DWT_SYS_STATUS_RXPHE");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_RXFCE) {
-		LOG_ERR("RX error DWT_SYS_STATUS_RXFCE");
+		LOG_INF("RX error DWT_SYS_STATUS_RXFCE");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_RXRFSL) {
-		LOG_ERR("RX error DWT_SYS_STATUS_RXRFSL");
+		LOG_INF("RX error DWT_SYS_STATUS_RXRFSL");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_RXOVRR) {
-		LOG_ERR("RX error DWT_SYS_STATUS_RXOVRR");
+		LOG_INF("RX error DWT_SYS_STATUS_RXOVRR");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_RXSFDTO) {
-		LOG_ERR("RX error DWT_SYS_STATUS_RXSFDTO");
+		LOG_INF("RX error DWT_SYS_STATUS_RXSFDTO");
 	}
 
 	if (sys_stat & DWT_SYS_STATUS_AFFREJ) {
-		LOG_ERR("RX error DWT_SYS_STATUS_AFFREJ");
+		LOG_INF("RX error DWT_SYS_STATUS_AFFREJ");
 	}
 
 	if (atomic_test_bit(&ctx->state, DWT_STATE_CCA)) {
@@ -1167,14 +1170,17 @@ static int dwt_set_power(const struct device *dev, int16_t dbm)
 
 static inline int setup_tx_frame(const struct device *dev, const uint8_t *data, uint8_t len) {
 	uint32_t tx_fctrl;
-
+	uint8_t data_cpy[len];
 	LOG_DBG("Setting up TX Frame");
+
+	// copy data otherwise it will be overwritten by dwt_register_write
+	memcpy(data_cpy, data, len);
 
 	/*
 	 * See "3 Message Transmission" in DW1000 User Manual for
 	 * more details about transmission configuration.
 	 */
-	if (dwt_register_write(dev, DWT_TX_BUFFER_ID, 0, len, data)) {
+	if (dwt_register_write(dev, DWT_TX_BUFFER_ID, 0, len, data_cpy)) {
 		LOG_ERR("Failed to write TX data");
 		return -EIO;
 	}
@@ -1597,10 +1603,15 @@ static uint32_t dwt_otpmem_read(const struct device *dev, uint16_t otp_addr)
 
 void dwt_set_antenna_delay_rx(const struct device *dev, uint16_t rx_delay_ts)
 {
+	struct dwt_context *ctx = dev->data;
+	ctx->rx_ant_dly = rx_delay_ts;
 	dwt_reg_write_u16(dev, DWT_LDE_IF_ID, DWT_LDE_RXANTD_OFFSET, rx_delay_ts);
 }
+
 void dwt_set_antenna_delay_tx(const struct device *dev, uint16_t tx_delay_ts)
 {
+	struct dwt_context *ctx = dev->data;
+	ctx->tx_ant_dly = tx_delay_ts;
 	dwt_reg_write_u16(dev, DWT_TX_ANTD_ID, DWT_TX_ANTD_OFFSET, tx_delay_ts);
 }
 uint16_t dwt_antenna_delay_rx(const struct device *dev)
@@ -1835,8 +1846,13 @@ static int dwt_initialise_dev(const struct device *dev)
 	dwt_set_spi_fast(dev);
 
 	/* Setup default antenna delay values */
+#if CONFIG_IEEE802154_DW1000_OTP_ANTENNA_DELAY
+	dwt_set_antenna_delay_rx(dev, otp_antenna_delay);
+	dwt_set_antenna_delay_tx(dev, otp_antenna_delay);
+#else
 	dwt_set_antenna_delay_rx(dev, DW1000_RX_ANT_DLY);
 	dwt_set_antenna_delay_tx(dev, DW1000_TX_ANT_DLY);
+#endif
 
 	/* Clear AON_CFG1 register */
 	dwt_reg_write_u8(dev, DWT_AON_ID, DWT_AON_CFG1_OFFSET, 0);
@@ -2451,13 +2467,12 @@ dwt_double_buffering_disable_txrx(const struct device *dev)
 
 
 struct mtm_ranging_setup_struct {
-	uint8_t position;
-	uint64_t setup_tx_frame_duration;
 	uint64_t slot_length;
-	uint64_t phy_action_delay;
 	uint64_t phy_activate_rx_delay;
-	uint16_t frame_timeout_period;
 	uint64_t initiation_delay;
+	uint64_t time_sync_guard;
+	uint16_t frame_timeout_period;
+	uint8_t repetitions;
 } mtm_ranging_conf = {
 	/* .slot_length = UUS_TO_DWT_TS(420), // smallest so far 420 */
 	/* .phy_activate_rx_delay = UUS_TO_DWT_TS(128 + 16), */
@@ -2467,21 +2482,41 @@ struct mtm_ranging_setup_struct {
 	.slot_length = UUS_TO_DWT_TS(450), // smallest so far 420
 	.phy_activate_rx_delay = UUS_TO_DWT_TS(128 + 16),
 	.initiation_delay = UUS_TO_DWT_TS(600), // round start is measured by RFRAME marker, so add about 500us for now
-	.frame_timeout_period = 400
+	.time_sync_guard = UUS_TO_DWT_TS(0), // when using high accuracy start point we don't need any time sync guard
+	.frame_timeout_period = 400,
+	.repetitions = 3,
 };
 
+/* #define DWT_RANGING_RESULT_SIZE 128 */
+/* static struct dwt_timestamp dwt_ranging_result_buf[DWT_RANGING_RESULT_SIZE]; */
 
-int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
+#define DWT_MTM_PROTOCOL_ID 0xCA
+#define DWT_MTM_START_FRAME_ID 0x01
+#define DWT_MTM_RANGIN_FRAME_ID 0x02
+
+// create a memory pool again for frame buffers
+K_HEAP_DEFINE(dwt_ranging_result_buf, sizeof(struct dwt_ranging_frame_buffer)*15*4);
+
+int dwt_mtm_ranging(const struct device *dev, uint8_t round_length, uint8_t slot_offset, uint8_t ranging_id) {
+	int ret = 0;
 	struct dwt_context *ctx = dev->data;
-	LOG_WRN("Ranging Start");
-	SET_GPIO_LOW(0);
-	SET_GPIO_LOW(1);
+	/* struct dwt_ranging_result ranging_result = { .timestamps = dwt_ranging_result_buf, .len = 0 }; */
+	struct dwt_ranging_frame_buffer *ranging_frames[mtm_ranging_conf.repetitions * round_length];
 
-	// reuse tx state here to prevent multiple ranging rounds from being started
+	uint64_t round_start_dw_ts;
+	int irq_state;
+	uint8_t current_repetition;
+	uint64_t slot_start_ts;
+	uint16_t antenna_delay = ctx->tx_ant_dly;
+
+	// --- Prevent execution of multiple ranging tasks
 	if (atomic_test_and_set_bit(&ctx->state, DWT_STATE_TX)) {
 		LOG_ERR("Transceiver busy");
 		return -EBUSY;
 	}
+
+	SET_GPIO_LOW(0);
+	SET_GPIO_LOW(1);
 
 	// reset to idle state and disable auto rx enabling
 	atomic_set_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU);
@@ -2493,14 +2528,23 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 	dwt_double_buffering_align(dev); // for the following execution we require that host and receiver side are aligned
 	k_sem_give(&ctx->dev_lock);
 
-	// --- Round Initiation ---
-	uint64_t round_start_dw_ts;
-	int irq_state;
+	// allocate round_length amount of ranging_frame_buffers
+	for(int i = 0; i < mtm_ranging_conf.repetitions; i++) {
+		for(int j = 0; j < round_length; j++) {
+			ranging_frames[i * round_length + j] = k_heap_alloc(&dwt_ranging_result_buf, sizeof(struct dwt_ranging_frame_buffer), K_NO_WAIT);
+			if(!ranging_frames[i * round_length + j]) {
+				LOG_ERR("failed to allocate frame buffer");
+				ret = -ENOMEM;
+				goto cleanup;
+			}
+		}
+	}
 
-	if (!pos) {
+	// --- Round Initiation ---
+	if (!slot_offset) {
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
 
-		uint8_t buf[3] = {0xDE, 0xCA, 0x1};
+		uint8_t buf[2] = {DWT_MTM_PROTOCOL_ID, DWT_MTM_START_FRAME_ID};
 
 		setup_tx_frame(dev, buf, 3);
 		dwt_fast_enable_tx(dev, 0);
@@ -2535,9 +2579,10 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 
 			dwt_switch_buffers(dev);
 
-			if(buf[0] != 0xDE || buf[1] != 0xCA || buf[2] != 0x1) {
-				LOG_ERR("Invalid packet received");
+			if(buf[0] != DWT_MTM_PROTOCOL_ID || buf[1] != DWT_MTM_START_FRAME_ID) {
+				LOG_ERR("invalid start of round frame");
 				k_sem_give(&ctx->dev_lock);
+				ret = -EIO;
 				goto cleanup;
 			}
 
@@ -2545,116 +2590,153 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t pos) {
 		} else {
 			goto cleanup;
 		}
-
 	}
 
 	if(irq_state == DWT_IRQ_ERR) {
-		LOG_ERR("Error");
+		ret = -EIO;
 		goto cleanup;
 	}
 
 	SET_GPIO_HIGH(1);
 
-	// --- Iterate through Phases ---
-	uint8_t current_phase = 0;
-	uint8_t round_length = 5;
-
-	uint64_t slot_start_ts = round_start_dw_ts
-		+ mtm_ranging_conf.initiation_delay;
-
-	// for our ranging round we want to use frame timeouts, so we set them here once
+	// --- do PHY setup for ranging round ---
 	k_sem_take(&ctx->dev_lock, K_FOREVER);
 	dwt_setup_rx_timeout(dev, mtm_ranging_conf.frame_timeout_period);
 	k_sem_give(&ctx->dev_lock);
 
-	while(current_phase < 1) { // TODO --- other phases
-		uint8_t slots = 0;
-		uint8_t buf[120] = {0xDE, 0xCA, 0x00};
-		uint64_t rx_timestamps[round_length];
-		uint8_t got_packet = 0;
+	// --- repeatedly execute ranging round ---
+	current_repetition = 0;
+	slot_start_ts = round_start_dw_ts + mtm_ranging_conf.initiation_delay;
 
-		memset(rx_timestamps, 0, sizeof(rx_timestamps));
+	// --- every repeated round there will be one outgoing frame from us ---
+	// --- in repetition 0 everybody basically just send a null frame without any contents ---
+	struct dwt_ranging_frame_buffer *outgoing_frame = ranging_frames[current_repetition*round_length + slot_offset];
+	outgoing_frame->prot_id = DWT_MTM_PROTOCOL_ID;
+	outgoing_frame->msg_id = DWT_MTM_RANGIN_FRAME_ID;
+	outgoing_frame->rx_ts_count = 0;
+	outgoing_frame->ranging_id = ranging_id;
+
+	while(current_repetition < mtm_ranging_conf.repetitions) {
+		uint8_t current_slot = 0, have_frame = 0;
+		uint16_t pkt_len;
+		uint32_t rx_finfo;
 
 		// --- Setup Transmision buffers on round start ---
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
-		setup_tx_frame(dev, buf, 120);
+		setup_tx_frame(dev, (uint8_t*) outgoing_frame, sizeof(struct dwt_ranging_frame_buffer));
 		k_sem_give(&ctx->dev_lock);
+
+		// --- in the following repetition we will send data that we collected throughout the round
+		outgoing_frame = ranging_frames[current_repetition*round_length + slot_offset];
+		outgoing_frame->prot_id = DWT_MTM_PROTOCOL_ID;
+		outgoing_frame->msg_id = DWT_MTM_RANGIN_FRAME_ID;
+		outgoing_frame->tx_ts.dwt_ts = slot_start_ts + (slot_offset * mtm_ranging_conf.slot_length) + mtm_ranging_conf.phy_activate_rx_delay + antenna_delay;
+		outgoing_frame->tx_ts.ranging_id = ranging_id;
+		outgoing_frame->rx_ts_count = 0;
+		outgoing_frame->ranging_id = ranging_id;
 
 		SET_GPIO_LOW(1);
 		// --- Begin transmission/reception loop ---
 		do {
-			// --- Decide the PHY action to execute
+			// --- Decide the PHY action to execute ---
 			k_sem_take(&ctx->dev_lock, K_FOREVER);
 
-			if(slots < round_length) {
-				if(slots == pos) {
-					// --- create scheduled transmission at slot_time
+			if(current_slot < round_length) {
+				// --- schedule next PHY action ---
+				if(current_slot == slot_offset) {
 					dwt_fast_enable_tx(dev, (slot_start_ts + mtm_ranging_conf.phy_activate_rx_delay) & DWT_TS_MASK);
 				} else {
-					// --- create scheduled reception at slot_time
 					dwt_fast_enable_rx(dev, slot_start_ts & DWT_TS_MASK);
 				}
 			}
 
-			// --- Let the PHY do its thing and continue work on the MCU
-			if(got_packet) {
+			// --- Let the PHY do its thing and continue work, work, work on the MCU
+			// --- https://www.youtube.com/watch?v=HL1UzIK-flA
+			if(have_frame) {
+				struct dwt_ranging_frame_buffer *incoming_frame = ranging_frames[current_repetition*round_length + (current_slot-1)];
 				SET_GPIO_HIGH(0);
-				uint32_t rx_finfo;
-				uint16_t pkt_len;
 
 				rx_finfo = dwt_reg_read_u32(dev, DWT_RX_FINFO_ID, DWT_RX_FINFO_OFFSET);
 				pkt_len = rx_finfo & DWT_RX_FINFO_RXFLEN_MASK;
 				uint8_t rx_buf[pkt_len];
 
-				dwt_register_read(dev, DWT_RX_BUFFER_ID, 0, pkt_len, rx_buf);
-				rx_timestamps[slots-1] = dwt_read_rx_timestamp(dev);
+				if((pkt_len-2) != sizeof(struct dwt_ranging_frame_buffer)) {
+					LOG_ERR("invalid frame length %u vs %u", pkt_len, sizeof(struct dwt_ranging_frame_buffer));
+				} else {
+					dwt_register_read(dev, DWT_RX_BUFFER_ID, 0, pkt_len, rx_buf);
+					// --- retrieve incoming frame ---
+					memcpy(incoming_frame, rx_buf, sizeof(struct dwt_ranging_frame_buffer));
 
-				if(rx_buf[0] != 0xDE) {
-					LOG_ERR("Invalid packet received");
+					if(incoming_frame->prot_id != DWT_MTM_PROTOCOL_ID || incoming_frame->msg_id != DWT_MTM_RANGIN_FRAME_ID) {
+						LOG_ERR("invalid ranging frame");
+					} else {
+						// --- update outgoing frame ---
+						outgoing_frame->rx_ts[outgoing_frame->rx_ts_count].dwt_ts = dwt_read_rx_timestamp(dev);
+						outgoing_frame->rx_ts[outgoing_frame->rx_ts_count].ranging_id = incoming_frame->ranging_id;
+						outgoing_frame->rx_ts_count++;
+					}
 				}
 
 				dwt_switch_buffers(dev);
-				SET_GPIO_LOW(0);
+				have_frame = 0;
 
-				got_packet = 0;
+				SET_GPIO_LOW(0);
 			}
+
 			k_sem_give(&ctx->dev_lock);
 
 			// --- Join with PHY
-			if(slots < round_length) {
+			if(current_slot < round_length) {
 				irq_state = wait_for_phy(dev);
 
 				if(irq_state == DWT_IRQ_RX_TIMEOUT) {
 					LOG_WRN("RXTO");
-					goto cleanup;
+					goto cleanup; // TODO when we don't goto cleanup here we get stuck, but why?
 				} else if(irq_state == DWT_IRQ_RX) {
-					got_packet = 1;
+					have_frame = 1;
 				} else if(irq_state == DWT_IRQ_TX) {
-					/* LOG_WRN("Tx"); */
 				} else if(irq_state == DWT_IRQ_ERR) {
-					/* LOG_ERR("Error"); */
+					ret = -EIO;
 					goto cleanup;
 				}
 			}
 
 			slot_start_ts += mtm_ranging_conf.slot_length;
 
-			slots++;
-		} while(slots < round_length + 1); // We add one more slot for processing the last received frame.
+			current_slot++;
+		} while(current_slot < round_length + 1); // We add one more slot for processing the last received frame.
 
-		current_phase++;
+		slot_start_ts += mtm_ranging_conf.initiation_delay;
+
+		current_repetition++;
 	}
 
-	LOG_WRN("Ranging finished");
+	// --- Call user defined callback ---
+	STRUCT_SECTION_FOREACH(ranging_data_callback, callback) {
+		if (callback->dev == NULL || callback->dev == dev) {
+			callback->callback(dev, ranging_frames, round_length, mtm_ranging_conf.repetitions);
+		}
+	}
 
   cleanup:
-	// get dev lock
+	// --- free resources ---
+	for(int i = 0; i < mtm_ranging_conf.repetitions; i++) {
+		for(int k = 0; k < round_length; k++) {
+			if(ranging_frames[i * round_length + k]) {
+				k_heap_free(&dwt_ranging_result_buf, ranging_frames[i * round_length + k]);
+			}
+		}
+	}
+
+	// --- clear bits ----
 	atomic_clear_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU);
 	atomic_set_bit(&ctx->state, DWT_STATE_RX_DEF_ON);
 	atomic_clear_bit(&ctx->state, DWT_STATE_TX);
 
 	SET_GPIO_LOW(0);
 	SET_GPIO_LOW(1);
+
+	return ret;
 }
 
 static const struct ieee802154_radio_api dwt_radio_api = {
