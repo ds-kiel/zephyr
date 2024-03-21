@@ -38,7 +38,7 @@ uint8_t *dwt_get_mac(const struct device *dev);
 
 
 /** Ranging Utility Functions **/
-struct dwt_timestamp {
+struct __attribute__((__packed__)) dwt_timestamp {
 	uint64_t dwt_ts;
 	uint8_t ranging_id;
 };
@@ -66,7 +66,7 @@ struct __attribute__((__packed__)) dwt_ranging_frame_buffer {
    After the conclusion of the callback, the memory of the dwt_ranging_result struct will be freed.
    You should therefore copy the data, in case that you need it for a longer time.
  */
-typedef void (*ranging_data_callback_t)(const struct device *dev, struct dwt_ranging_frame_buffer **buffers, size_t round_length, size_t repetitions);
+typedef void (*ranging_data_callback_t)(const struct device *dev, struct dwt_ranging_frame_buffer *buffers, size_t round_length, size_t repetitions);
 
 struct ranging_data_callback {
 	const struct device *dev;

@@ -1847,14 +1847,14 @@ static int dwt_initialise_dev(const struct device *dev)
 
 	/* Setup default antenna delay values */
 #if CONFIG_IEEE802154_DW1000_OTP_ANTENNA_DELAY
-	dwt_set_antenna_delay_rx(dev, otp_antenna_delay);
-	dwt_set_antenna_delay_tx(dev, otp_antenna_delay);
+	dwt_set_antenna_delay_rx(dev, otp_antenna_delay & 0xFFFF);
+	dwt_set_antenna_delay_tx(dev, otp_antenna_delay & 0xFFFF);
 #else
 	dwt_set_antenna_delay_rx(dev, DW1000_RX_ANT_DLY);
 	dwt_set_antenna_delay_tx(dev, DW1000_TX_ANT_DLY);
 #endif
 
-	/* Clear AON_CFG1 register */
+ 	/* Clear AON_CFG1 register */
 	dwt_reg_write_u8(dev, DWT_AON_ID, DWT_AON_CFG1_OFFSET, 0);
 	/*
 	 * Configure sleep mode:
@@ -2474,14 +2474,15 @@ struct mtm_ranging_setup_struct {
 	uint16_t frame_timeout_period;
 	uint8_t repetitions;
 } mtm_ranging_conf = {
-	/* .slot_length = UUS_TO_DWT_TS(420), // smallest so far 420 */
-	/* .phy_activate_rx_delay = UUS_TO_DWT_TS(128 + 16), */
-	/* .initiation_delay = UUS_TO_DWT_TS(700), // round start is measured by RFRAME marker, so add about 500us for now */
-	/* .frame_timeout_period = 400 */
+	/* .slot_length = UUS_TO_DWT_TS(2000), // smallest so far 420 */
+	/* .phy_activate_rx_delay = UUS_TO_DWT_TS(250 + 16), */
+	/* .initiation_delay = UUS_TO_DWT_TS(2000), // round start is measured by RFRAME marker, so add about 500us for now */
+	/* .time_sync_guard = UUS_TO_DWT_TS(0), // when using high accuracy start point we don't need any time sync guard */
+	/* .frame_timeout_period = 900, */
 
-	.slot_length = UUS_TO_DWT_TS(450), // smallest so far 420
+	.slot_length = UUS_TO_DWT_TS(450), // 450
 	.phy_activate_rx_delay = UUS_TO_DWT_TS(128 + 16),
-	.initiation_delay = UUS_TO_DWT_TS(600), // round start is measured by RFRAME marker, so add about 500us for now
+	.initiation_delay = UUS_TO_DWT_TS(600), // round start is measured by RFRAME marker, so add about 600us for now
 	.time_sync_guard = UUS_TO_DWT_TS(0), // when using high accuracy start point we don't need any time sync guard
 	.frame_timeout_period = 400,
 	.repetitions = 3,
@@ -2495,17 +2496,22 @@ struct mtm_ranging_setup_struct {
 #define DWT_MTM_RANGIN_FRAME_ID 0x02
 
 // create a memory pool again for frame buffers
-K_HEAP_DEFINE(dwt_ranging_result_buf, sizeof(struct dwt_ranging_frame_buffer)*15*4);
+// doesnt currently work, after a certain amount of nodes, not sure if its my fault
+// but it will fail after having to free 10 nodes -> Update: fixed this i am stupid and c should have optional access bound checking on arrays...
+/* K_HEAP_DEFINE(dwt_ranging_result_buf, sizeof(struct dwt_ranging_frame_buffer)*100); */
+
+#define DWT_MAX_ROUND_LENGTH 15
+#define DWT_MAX_REPETITIONS 4
+static struct dwt_ranging_frame_buffer ranging_frames[DWT_MAX_ROUND_LENGTH * DWT_MAX_REPETITIONS];
 
 int dwt_mtm_ranging(const struct device *dev, uint8_t round_length, uint8_t slot_offset, uint8_t ranging_id) {
 	int ret = 0;
 	struct dwt_context *ctx = dev->data;
 	/* struct dwt_ranging_result ranging_result = { .timestamps = dwt_ranging_result_buf, .len = 0 }; */
-	struct dwt_ranging_frame_buffer *ranging_frames[mtm_ranging_conf.repetitions * round_length];
+	/* struct dwt_ranging_frame_buffer *ranging_frames[mtm_ranging_conf.repetitions * round_length]; */
 
 	uint64_t round_start_dw_ts;
 	int irq_state;
-	uint8_t current_repetition;
 	uint64_t slot_start_ts;
 	uint16_t antenna_delay = ctx->tx_ant_dly;
 
@@ -2529,16 +2535,16 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t round_length, uint8_t slot
 	k_sem_give(&ctx->dev_lock);
 
 	// allocate round_length amount of ranging_frame_buffers
-	for(int i = 0; i < mtm_ranging_conf.repetitions; i++) {
-		for(int j = 0; j < round_length; j++) {
-			ranging_frames[i * round_length + j] = k_heap_alloc(&dwt_ranging_result_buf, sizeof(struct dwt_ranging_frame_buffer), K_NO_WAIT);
-			if(!ranging_frames[i * round_length + j]) {
-				LOG_ERR("failed to allocate frame buffer");
-				ret = -ENOMEM;
-				goto cleanup;
-			}
-		}
-	}
+	/* for(int i = 0; i < mtm_ranging_conf.repetitions*round_length; i++) { */
+	/* 	ranging_frames[i] = k_heap_alloc(&dwt_ranging_result_buf, sizeof(struct dwt_ranging_frame_buffer), K_NO_WAIT); */
+	/* 	if(!ranging_frames[i]) { */
+	/* 		LOG_ERR("failed to allocate frame buffer"); */
+	/* 		for(int j = 0; j < i; j++) { */
+	/* 			k_heap_free(&dwt_ranging_result_buf, ranging_frames[j]); */
+	/* 		} */
+	/* 		ret = -ENOMEM; */
+	/* 	} */
+	/* } */
 
 	// --- Round Initiation ---
 	if (!slot_offset) {
@@ -2546,7 +2552,7 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t round_length, uint8_t slot
 
 		uint8_t buf[2] = {DWT_MTM_PROTOCOL_ID, DWT_MTM_START_FRAME_ID};
 
-		setup_tx_frame(dev, buf, 3);
+		setup_tx_frame(dev, buf, 2);
 		dwt_fast_enable_tx(dev, 0);
 
 		k_sem_give(&ctx->dev_lock);
@@ -2605,35 +2611,42 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t round_length, uint8_t slot
 	k_sem_give(&ctx->dev_lock);
 
 	// --- repeatedly execute ranging round ---
-	current_repetition = 0;
 	slot_start_ts = round_start_dw_ts + mtm_ranging_conf.initiation_delay;
 
 	// --- every repeated round there will be one outgoing frame from us ---
 	// --- in repetition 0 everybody basically just send a null frame without any contents ---
-	struct dwt_ranging_frame_buffer *outgoing_frame = ranging_frames[current_repetition*round_length + slot_offset];
-	outgoing_frame->prot_id = DWT_MTM_PROTOCOL_ID;
-	outgoing_frame->msg_id = DWT_MTM_RANGIN_FRAME_ID;
-	outgoing_frame->rx_ts_count = 0;
-	outgoing_frame->ranging_id = ranging_id;
+	struct dwt_ranging_frame_buffer *next_outgoing_frame = &ranging_frames[slot_offset];
+	next_outgoing_frame->prot_id = DWT_MTM_PROTOCOL_ID;
+	next_outgoing_frame->msg_id = DWT_MTM_RANGIN_FRAME_ID;
+	next_outgoing_frame->rx_ts_count = 0;
+	next_outgoing_frame->ranging_id = ranging_id;
 
-	while(current_repetition < mtm_ranging_conf.repetitions) {
+
+	for(size_t current_repetition = 0; current_repetition < mtm_ranging_conf.repetitions; current_repetition++) {
 		uint8_t current_slot = 0, have_frame = 0;
 		uint16_t pkt_len;
 		uint32_t rx_finfo;
 
-		// --- Setup Transmision buffers on round start ---
+		// --- load next outgoing frame into transmission buffer ---
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
-		setup_tx_frame(dev, (uint8_t*) outgoing_frame, sizeof(struct dwt_ranging_frame_buffer));
+		setup_tx_frame(dev, (uint8_t*) next_outgoing_frame, sizeof(struct dwt_ranging_frame_buffer));
 		k_sem_give(&ctx->dev_lock);
 
 		// --- in the following repetition we will send data that we collected throughout the round
-		outgoing_frame = ranging_frames[current_repetition*round_length + slot_offset];
-		outgoing_frame->prot_id = DWT_MTM_PROTOCOL_ID;
-		outgoing_frame->msg_id = DWT_MTM_RANGIN_FRAME_ID;
-		outgoing_frame->tx_ts.dwt_ts = slot_start_ts + (slot_offset * mtm_ranging_conf.slot_length) + mtm_ranging_conf.phy_activate_rx_delay + antenna_delay;
-		outgoing_frame->tx_ts.ranging_id = ranging_id;
-		outgoing_frame->rx_ts_count = 0;
-		outgoing_frame->ranging_id = ranging_id;
+
+		if(current_repetition < mtm_ranging_conf.repetitions-1) { // in the last repetition we will not prepare another frame
+			/* LOG_WRN("prepare next outgoing frame at %u", (current_repetition+1)*round_length + slot_offset); */
+			next_outgoing_frame = &ranging_frames[(current_repetition+1)*round_length + slot_offset];
+			next_outgoing_frame->prot_id = DWT_MTM_PROTOCOL_ID;
+			next_outgoing_frame->msg_id = DWT_MTM_RANGIN_FRAME_ID;
+			next_outgoing_frame->tx_ts.dwt_ts =
+				( ( slot_start_ts + (slot_offset * mtm_ranging_conf.slot_length) + mtm_ranging_conf.phy_activate_rx_delay ) & ((uint64_t) 0xFFFFFFFE00ULL) )
+				+ antenna_delay;
+
+			next_outgoing_frame->tx_ts.ranging_id = ranging_id;
+			next_outgoing_frame->rx_ts_count = 0;
+			next_outgoing_frame->ranging_id = ranging_id;
+		}
 
 		SET_GPIO_LOW(1);
 		// --- Begin transmission/reception loop ---
@@ -2653,7 +2666,9 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t round_length, uint8_t slot
 			// --- Let the PHY do its thing and continue work, work, work on the MCU
 			// --- https://www.youtube.com/watch?v=HL1UzIK-flA
 			if(have_frame) {
-				struct dwt_ranging_frame_buffer *incoming_frame = ranging_frames[current_repetition*round_length + (current_slot-1)];
+				// in slot N we process the frame of slot N-1
+				struct dwt_ranging_frame_buffer *incoming_frame = &ranging_frames[current_repetition*round_length + (current_slot-1)];
+
 				SET_GPIO_HIGH(0);
 
 				rx_finfo = dwt_reg_read_u32(dev, DWT_RX_FINFO_ID, DWT_RX_FINFO_OFFSET);
@@ -2664,6 +2679,7 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t round_length, uint8_t slot
 					LOG_ERR("invalid frame length %u vs %u", pkt_len, sizeof(struct dwt_ranging_frame_buffer));
 				} else {
 					dwt_register_read(dev, DWT_RX_BUFFER_ID, 0, pkt_len, rx_buf);
+
 					// --- retrieve incoming frame ---
 					memcpy(incoming_frame, rx_buf, sizeof(struct dwt_ranging_frame_buffer));
 
@@ -2671,10 +2687,13 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t round_length, uint8_t slot
 						LOG_ERR("invalid ranging frame");
 					} else {
 						// --- update outgoing frame ---
-						outgoing_frame->rx_ts[outgoing_frame->rx_ts_count].dwt_ts = dwt_read_rx_timestamp(dev);
-						outgoing_frame->rx_ts[outgoing_frame->rx_ts_count].ranging_id = incoming_frame->ranging_id;
-						outgoing_frame->rx_ts_count++;
+						if(current_repetition < mtm_ranging_conf.repetitions-1) {
+							next_outgoing_frame->rx_ts[next_outgoing_frame->rx_ts_count].dwt_ts = dwt_read_rx_timestamp(dev);
+							next_outgoing_frame->rx_ts[next_outgoing_frame->rx_ts_count].ranging_id = incoming_frame->ranging_id;
+							next_outgoing_frame->rx_ts_count++;
+						}
 					}
+
 				}
 
 				dwt_switch_buffers(dev);
@@ -2707,8 +2726,6 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t round_length, uint8_t slot
 		} while(current_slot < round_length + 1); // We add one more slot for processing the last received frame.
 
 		slot_start_ts += mtm_ranging_conf.initiation_delay;
-
-		current_repetition++;
 	}
 
 	// --- Call user defined callback ---
@@ -2720,13 +2737,9 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t round_length, uint8_t slot
 
   cleanup:
 	// --- free resources ---
-	for(int i = 0; i < mtm_ranging_conf.repetitions; i++) {
-		for(int k = 0; k < round_length; k++) {
-			if(ranging_frames[i * round_length + k]) {
-				k_heap_free(&dwt_ranging_result_buf, ranging_frames[i * round_length + k]);
-			}
-		}
-	}
+	/* for(int i = 0; i < mtm_ranging_conf.repetitions*round_length; i++) { */
+	/* 	k_heap_free(&dwt_ranging_result_buf, ranging_frames[i]); */
+	/* } */
 
 	// --- clear bits ----
 	atomic_clear_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU);
