@@ -40,27 +40,60 @@ uint8_t *dwt_get_mac(const struct device *dev);
 
 
 /** Ranging Utility Functions **/
-struct mtm_mtm_ranging_setup_struct {
-	uint64_t slot_length;
-	uint64_t phy_activate_rx_delay;
-	uint64_t phase_setup_delay;
-	uint64_t time_sync_guard;
-	uint16_t frame_timeout_period;
+struct mtm_ranging_timing {
+	uint64_t slot_length,
+		phy_activate_rx_delay,
+		phase_setup_delay,
+		time_sync_guard,
+		preamble_chunk_duration;
+	uint16_t frame_timeout_period, preamble_timeout;
 	uint8_t repetitions;
 };
 
-struct __attribute__((__packed__)) dwt_timestamp {
-	uint64_t dwt_ts;
+struct mtm_ranging_config {
+	uint8_t round_length, repetitions;
+	uint8_t tx_slot_offset;
+	uint8_t use_initiation_frame, cca, reject_frames;
+
+	uint8_t valid_fp_index_range;
+	uint16_t timeout_us;
+	uint16_t cca_duration;
+};
+
+typedef uint8_t dwt_packed_ts_t[5];
+typedef uint64_t dwt_ts_t;
+
+dwt_ts_t from_packed_dwt_ts(const dwt_packed_ts_t ts);
+void to_packed_dwt_ts(dwt_packed_ts_t ts, dwt_ts_t value);
+
+struct __attribute__((__packed__)) dwt_tagged_timestamp {
+	dwt_packed_ts_t ts;
 	uint8_t ranging_id;
 };
 
 struct __attribute__((__packed__)) dwt_ranging_frame_buffer {
-	uint8_t  prot_id;     // some identifier that this is a MTM ranging protocol execution
-	uint8_t  msg_id;      // some identifier of which message type during the protocol run we are sending
-	uint8_t  ranging_id;      // some ranging id, in case of time slotted access this is equivalent to the transmission slot in the schedule
+	uint8_t  prot_id;     // identifier that this is a MTM ranging protocol execution
+	uint8_t  msg_id;      // identifier of which message type during the protocol run we are sending
+	uint8_t  ranging_id;  // unique identifier of this node for ranging
 	uint8_t  rx_ts_count; // amount of received timestamps
-	struct dwt_timestamp tx_ts;
-	struct dwt_timestamp rx_ts[10];   // for now allocate space for 12 timestamps
+	dwt_packed_ts_t tx_ts;
+	dwt_packed_ts_t phase_start_ts; // this will eventually replace tx_ts.
+	struct dwt_tagged_timestamp rx_ts[15];   // for now allocate space for 10 timestamps
+};
+
+enum dwt_ranging_frame_status {
+	DWT_MTM_FRAME_OKAY,
+	DWT_MTM_FRAME_REJECTED
+};
+
+struct dwt_ranging_frame_info {
+	struct dwt_ranging_frame_buffer *frame;
+	enum dwt_ranging_frame_status status;
+	int8_t rx_level;
+	uint32_t rx_pacc;
+	uint16_t fp_index;
+	uint8_t slot; // might be unecessary since we currently index the return array by the respective slot number
+	dwt_ts_t timestamp;
 };
 
 struct dwt_glossy_tx_result {
@@ -101,7 +134,13 @@ struct dwt_glossy_tx_result {
  * If use_initiation_frame is not set, the ranging round will start immediately.
  *
 */
-int      dwt_mtm_ranging(const struct device *dev, uint8_t round_length, uint8_t slot_offset, uint8_t ranging_id, uint8_t use_initiation_frame, uint16_t timeout_us, struct dwt_ranging_frame_buffer **buffers);
+
+enum dwt_mtm_ranging_slot {
+	DWT_TX_AUTO = 0xFE, // TODO implement, this indicates that a transmission is wanted, but no transmission slot is specified
+	DWT_NO_TX_SLOT = 0xFF, // indicates that a node should not transmit during this round
+};
+
+int dwt_mtm_ranging(const struct device *dev, uint8_t ranging_id, const struct mtm_ranging_config *conf, struct dwt_ranging_frame_info **buffers);
 int      dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t node_id, uint16_t timeout_us, struct dwt_glossy_tx_result *result);
 
 void     dwt_set_antenna_delay_rx(const struct device *dev, uint16_t rx_delay_ts);

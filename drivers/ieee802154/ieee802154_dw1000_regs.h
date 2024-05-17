@@ -527,6 +527,17 @@
 #define DWT_RX_FQUAL_ID             0x12
 /* Note 64 bit register */
 #define DWT_RX_FQUAL_LEN            8
+
+
+#define DWT_RX_FQUAL_CIR_PWR_OFFSET 5
+#define DWT_RX_FQUAL_CIR_PWR_LEN 2
+#define DWT_RX_FQUAL_STD_NOISE_OFFSET 0
+#define DWT_RX_FQUAL_STD_NOISE_LEN 2
+#define DWT_RX_FQUAL_FP_AMPL2_OFFSET 1
+#define DWT_RX_FQUAL_FP_AMPL2_LEN 2
+#define DWT_RX_FQUAL_PP_AMPL3_OFFSET 3
+#define DWT_RX_FQUAL_PP_AMPL3_LEN 2
+
 /* Standard Deviation of Noise */
 #define DWT_RX_EQUAL_STD_NOISE_MASK 0x0000FFFFULL
 #define DWT_RX_EQUAL_STD_NOISE_SHIFT 0
