@@ -400,7 +400,6 @@ static int dwt_spi_write(const struct device *dev,
 }
 #else
 
-static volatile size_t received;
 static bool spi_transfer(const uint8_t *tx_data, size_t tx_data_len,
 			  uint8_t *rx_buf, size_t rx_buf_size)
 {
@@ -434,11 +433,15 @@ static bool spi_transfer(const uint8_t *tx_data, size_t tx_data_len,
 		return false;
 	}
 #endif
-
-	received = rx_buf_size;
 	return true;
 }
 
+
+// TODO: this is sadly really unoptimal. Sadly if we use the nrfx spi API directly, we are not able
+// to chain together multiple transfers. Usually this is not a problem and by giving up that feature
+// we save a lot of time when doing small transfers, however when doing larger transfers we will run
+// into problems with the amount of stack memory since we have to copy the data to the stack to
+// merge with the header before dispatching the transfer.
 static int dwt_spi_read(const struct device *dev, uint16_t hdr_len, const uint8_t *hdr_buf,
 			uint32_t data_len, uint8_t *data)
 {
@@ -460,15 +463,8 @@ static int dwt_spi_read(const struct device *dev, uint16_t hdr_len, const uint8_
 		return -1; // Or any other error handling code
 	}
 
-	// Assuming the received data should be copied back to 'data'
+	// Copy back to data
 	memcpy(data, rx_buf + hdr_len, data_len);
-
-	/* printk("Received data: "); */
-	/* for (uint32_t i = 0; i < data_len; i++) { */
-	/* 	printk("%02x ", data[i]); // Print each byte of received data in hex format */
-	/* } */
-	/* printk("\n"); // New line after printing all data */
-
 
 	return 0; // Success
 }
@@ -1698,6 +1694,27 @@ static inline void dwt_set_sysclks_auto(const struct device *dev)
 	dwt_reg_write_u8(dev, DWT_PMSC_ID, DWT_PMSC_CTRL0_OFFSET, sclks);
 }
 
+
+static inline void dwt_enable_accumulator_memory_access(const struct device *dev) {
+	uint8_t sclks = dwt_reg_read_u8(dev, DWT_PMSC_ID, DWT_PMSC_CTRL0_OFFSET);
+
+	// clear previous value of RXCLK
+	sclks = (sclks & ~DWT_PMSC_CTRL0_RXCLKS_MASK);
+	sclks |= DWT_PMSC_CTRL0_FACE | DWT_PMSC_CTRL0_AMCE | DWT_PMSC_CTRL0_RXCLKS_125M;
+
+	dwt_reg_write_u8(dev, DWT_PMSC_ID, DWT_PMSC_CTRL0_OFFSET, sclks);
+}
+
+static inline void dwt_disable_accumulator_memory_access(const struct device *dev) {
+	uint8_t sclks = dwt_reg_read_u8(dev, DWT_PMSC_ID, DWT_PMSC_CTRL0_OFFSET);
+
+	// clear previous value of RXCLK
+	sclks = (sclks & ~DWT_PMSC_CTRL0_RXCLKS_MASK) | DWT_PMSC_CTRL0_RXCLKS_AUTO;
+	sclks &= ~(DWT_PMSC_CTRL0_FACE | DWT_PMSC_CTRL0_AMCE);
+
+	dwt_reg_write_u8(dev, DWT_PMSC_ID, DWT_PMSC_CTRL0_OFFSET, sclks);
+}
+
 static uint32_t dwt_otpmem_read(const struct device *dev, uint16_t otp_addr)
 {
 	dwt_reg_write_u16(dev, DWT_OTP_IF_ID, DWT_OTP_ADDR, otp_addr);
@@ -2531,7 +2548,11 @@ struct mtm_ranging_timing mtm_ranging_conf = {
 // amount of guard period required, as the synchronization will be less accurate than if we would
 // use a initiation frame as round start event.
 struct mtm_ranging_timing mtm_ranging_glossy_timesync_conf = {
+#if CONFIG_DWT_MTM_OUTPUT_CIR
+	.slot_length = UUS_TO_DWT_TS(200000), // Outputting ACC MEM data takes a long time
+#else
 	.slot_length = UUS_TO_DWT_TS(700), // 450
+#endif
 	.phy_activate_rx_delay = UUS_TO_DWT_TS(128 + 16),
 	.phase_setup_delay = UUS_TO_DWT_TS(700), // round start is measured by RFRAME marker, so add about 600us for now
 	.time_sync_guard = UUS_TO_DWT_TS(150), // a 100 microsecond guard should be fine
@@ -2586,7 +2607,7 @@ struct __attribute__((__packed__)) dwt_glossy_frame_buffer {
 #define DWT_MTM_RANGIN_FRAME_ID 0x02
 #define DWT_MTM_GLOSSY_TX_ID 0x03
 #define DWT_MTM_MAX_ROUND_LENGTH 15
-#define DWT_MTM_MAX_REPETITIONS 5
+#define DWT_MTM_MAX_REPETITIONS 3
 
 int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t node_id, uint16_t timeout_us, struct dwt_glossy_tx_result *result) {
 	int ret = 0;
@@ -2729,6 +2750,13 @@ int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t
 static struct dwt_ranging_frame_buffer ranging_frames[DWT_MTM_MAX_ROUND_LENGTH * DWT_MTM_MAX_REPETITIONS];
 static struct dwt_ranging_frame_info frame_infos[DWT_MTM_MAX_ROUND_LENGTH * DWT_MTM_MAX_REPETITIONS];
 
+#if CONFIG_DWT_MTM_OUTPUT_CIR
+// we will directly insert the header into the buffer, because of the limitiations of using nrfx spi
+// directly .Write into this buffer starting from offset 0, but read into it simultanously from
+// offset 1
+static uint8_t cir_acc_mem[4066];
+#endif
+
 dwt_ts_t from_packed_dwt_ts(const dwt_packed_ts_t ts) {
 	return (dwt_ts_t) ts[0] | ((dwt_ts_t) ts[1] << 8) | ((dwt_ts_t) ts[2] << 16) | ((dwt_ts_t) ts[3] << 24) | ((dwt_ts_t) ts[4] << 32);
 }
@@ -2765,7 +2793,6 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t ranging_id, const struct m
 		return -EBUSY;
 	}
 
-	SET_GPIO_LOW(1);
 
 	// store old state
 	old_state = ctx->state;
@@ -2784,6 +2811,8 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t ranging_id, const struct m
 	dwt_set_frame_filter(dev, 0, 0);
 	dwt_double_buffering_align(dev); // for the following execution we require that host and receiver side are aligned
 	k_sem_give(&ctx->dev_lock);
+
+
 
 	// --- Optional: Round Initiation ---
 	if (conf->use_initiation_frame) {
@@ -2882,7 +2911,6 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t ranging_id, const struct m
 
 
 		// --- in the following repetition we will send data that we collected throughout the round
-		SET_GPIO_HIGH(1);
 		if(transmission_slot != DWT_NO_TX_SLOT) {
 			current_frame_transmission_ts = ((slot_start_ts + (transmission_slot * ranging_conf->slot_length)
 					+ ranging_conf->phy_activate_rx_delay
@@ -2911,7 +2939,6 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t ranging_id, const struct m
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
 		setup_tx_frame(dev, (uint8_t*) next_outgoing_frame, sizeof(struct dwt_ranging_frame_buffer));
 		k_sem_give(&ctx->dev_lock);
-		SET_GPIO_LOW(1);
 
 		if(transmission_slot != DWT_NO_TX_SLOT) {
 			next_outgoing_frame      = &ranging_frames[(current_repetition+1)*conf->round_length + transmission_slot];
@@ -2945,6 +2972,7 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t ranging_id, const struct m
 
 			// --- Let the PHY do its thing and continue work, work, work on the MCU
 			// --- https://www.youtube.com/watch?v=HL1UzIK-flA
+			// --- I.e., here we do process concurrently
 			if(have_frame) {
 				// in slot N we process the frame of slot N-1
 				struct dwt_ranging_frame_info   *incoming_frame_info = &frame_infos[current_repetition*conf->round_length + (current_slot-1)];
@@ -3049,6 +3077,31 @@ int dwt_mtm_ranging(const struct device *dev, uint8_t ranging_id, const struct m
 					}
 				} else if(irq_state == DWT_IRQ_RX) {
 					have_frame = 1;
+
+
+					// OPTIONAL: Read out data which can't be read concurrently
+#if CONFIG_DWT_MTM_OUTPUT_CIR
+					if(conf->extract_cir) {
+						// first we do a bulk extract of the impulse memory
+						/* dwt_register_read(dev, DWT_ACC_MEM_ID, 0, sizeof(cir_acc_mem), cir_acc_mem); */
+						SET_GPIO_HIGH(1);
+						dwt_enable_accumulator_memory_access(dev);
+						char tx_buf[1] = {DWT_ACC_MEM_ID};
+						spi_transfer(tx_buf, 1, cir_acc_mem, 4066);
+
+						// We are not able to buffer the CIR for every
+						// reception in the round. Therefore, we directly
+						// call a upper-layer handler for the cir This might
+						// also be useful in the future since the upper
+						// layer might want to decide whether to throw away
+						// the transmission based on the cir.
+
+						dwt_disable_accumulator_memory_access(dev);
+
+						conf->cir_handler(current_slot, current_repetition, cir_acc_mem+2, 4064);
+						SET_GPIO_LOW(1);
+					}
+#endif
 				} else if(irq_state == DWT_IRQ_TX) {
 				} else if(irq_state == DWT_IRQ_ERR) {
 					ret = -EIO;

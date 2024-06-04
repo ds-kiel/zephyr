@@ -50,10 +50,18 @@ struct mtm_ranging_timing {
 	uint8_t repetitions;
 };
 
+
+typedef int (*cir_memory_callback_t)(int slot, int repetition, const uint8_t *cir_memory, size_t size);
+
 struct mtm_ranging_config {
 	uint8_t round_length, repetitions;
 	uint8_t tx_slot_offset;
 	uint8_t use_initiation_frame, cca, reject_frames;
+
+#if CONFIG_DWT_MTM_OUTPUT_CIR
+	uint8_t extract_cir;
+	cir_memory_callback_t cir_handler;
+#endif
 
 	uint8_t valid_fp_index_range;
 	uint16_t timeout_us;
@@ -100,6 +108,7 @@ struct dwt_glossy_tx_result {
 	struct timeutil_sync_instant clock_sync_instant;
 	uint8_t dist_to_root; // aka hop counter
 };
+
 
 /* Comment: this is similar to how the kernel GNSS interface is structured, however, note that the most
    recent IEEE802.15.4z standard already has a pretty good abstraction for how ranging data shall be passed

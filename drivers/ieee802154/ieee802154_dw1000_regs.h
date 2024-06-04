@@ -1763,6 +1763,10 @@
  * The system clock will run off the 19.2 MHz XTI clock until the PLL is
  * calibrated and locked, then it will switch over the 125 MHz PLL clock
  */
+
+#define DWT_PMSC_CTRL0_RXCLKS_MASK  0x0000000CUL
+#define DWT_PMSC_CTRL0_SYSCLK_MASK  0x00000003UL
+
 #define DWT_PMSC_CTRL0_SYSCLKS_AUTO 0x00000000UL
 /* Force system clock to be the 19.2 MHz XTI clock. */
 #define DWT_PMSC_CTRL0_SYSCLKS_19M  0x00000001UL
@@ -1786,6 +1790,8 @@
 #define DWT_PMSC_CTRL0_TXCLKS_OFF   0x00000030UL
 /* Force Accumulator Clock Enable */
 #define DWT_PMSC_CTRL0_FACE         0x00000040UL
+/*Accumulator Memory Clock Enable */
+#define DWT_PMSC_CTRL0_AMCE         0x00008000UL
 /* GPIO clock enable */
 #define DWT_PMSC_CTRL0_GPCE         0x00010000UL
 /* GPIO reset (NOT), active low */
