@@ -41,27 +41,27 @@ uint8_t *dwt_get_mac(const struct device *dev);
 
 /** Ranging Utility Functions **/
 struct mtm_ranging_timing {
-	uint64_t slot_length,
+	uint64_t min_slot_length_us,
 		phy_activate_rx_delay,
 		phase_setup_delay,
-		time_sync_guard,
 		preamble_chunk_duration;
 	uint16_t frame_timeout_period, preamble_timeout;
-	uint8_t repetitions;
 };
 
 
-typedef int (*cir_memory_callback_t)(int slot, int repetition, const uint8_t *cir_memory, size_t size);
+typedef int (*cir_memory_callback_t)(int slot, int phase, const uint8_t *cir_memory, size_t size);
 
 struct mtm_ranging_config {
-	uint8_t round_length, repetitions;
+	uint8_t ranging_id;
+	uint8_t slots_per_phase, phases;
 	uint8_t tx_slot_offset;
-	uint8_t use_initiation_frame, cca, reject_frames;
+	uint32_t slot_duration_us, guard_period_us;
+	uint64_t micro_slot_offset_ns;
 
-#if CONFIG_DWT_MTM_OUTPUT_CIR
-	uint8_t extract_cir;
+	// options
+	uint8_t use_initiation_frame, cca, reject_frames, cfo;
+
 	cir_memory_callback_t cir_handler;
-#endif
 
 	uint8_t valid_fp_index_range;
 	uint16_t timeout_us;
@@ -97,10 +97,18 @@ enum dwt_ranging_frame_status {
 struct dwt_ranging_frame_info {
 	struct dwt_ranging_frame_buffer *frame;
 	enum dwt_ranging_frame_status status;
-	int8_t rx_level;
+
+	enum dwt_ranging_frame_info_type {
+		DWT_RANGING_TRANSMITTED_FRAME = 0,
+		DWT_RANGING_RECEIVED_FRAME = 1,
+	} type;
+
 	uint32_t rx_pacc;
-	uint16_t fp_index;
+	int8_t cir_pwr;
+	uint16_t fp_index, fp_ampl1, fp_ampl2, fp_ampl3, std_noise;
 	uint8_t slot; // might be unecessary since we currently index the return array by the respective slot number
+	float cfo_ppm;
+
 	dwt_ts_t timestamp;
 };
 
@@ -109,47 +117,13 @@ struct dwt_glossy_tx_result {
 	uint8_t dist_to_root; // aka hop counter
 };
 
-
-/* Comment: this is similar to how the kernel GNSS interface is structured, however, note that the most
-   recent IEEE802.15.4z standard already has a pretty good abstraction for how ranging data shall be passed
-   between MAC and higher levels (As is true for the execution of the ranging itself. In the future
-   we should adapt our code to the standard.
-
-   After the conclusion of the callback, the memory of the dwt_ranging_result struct will be freed.
-   You should therefore copy the data, in case that you need it for a longer time.
- */
-/* typedef void (*ranging_data_callback_t)(const struct device *dev, struct dwt_ranging_frame_buffer *buffers, size_t round_length, size_t repetitions); */
-
-/* struct ranging_data_callback { */
-/* 	const struct device *dev; */
-/* 	/\** Callback called when ranging data from round is published *\/ */
-/* 	ranging_data_callback_t callback; */
-/* }; */
-
-/* #define RANGING_DATA_CALLBACK_DEFINE(_dev, _callback)                                              \ */
-/* 	static const STRUCT_SECTION_ITERABLE(ranging_data_callback,                                \ */
-/* 					     _ranging_data_callback__##_callback) = {              \ */
-/* 		.dev = _dev,                                                                    \ */
-/* 		.callback = _callback,                                                          \ */
-/* 	} */
-
-/* If use_initiation_frame is set, the node which is assigned to slot_offset 0 will send an
- * initiation frame in order to kickoff the round, since we can schedule our subsequent transmission
- * upon this frame with nano-second precision, we don't require any time synchronization related
- * guard times, which allows us to shorten the round and converse more energy. Furthermore,
- * the parameter timeout_us determines the time to wait until we stop waiting for a initial frame.
- * Setting timeout_us to 0 will result in an infinite wait time.
- *
- * If use_initiation_frame is not set, the ranging round will start immediately.
- *
-*/
-
 enum dwt_mtm_ranging_slot {
 	DWT_TX_AUTO = 0xFE, // TODO implement, this indicates that a transmission is wanted, but no transmission slot is specified
 	DWT_NO_TX_SLOT = 0xFF, // indicates that a node should not transmit during this round
 };
 
-int dwt_mtm_ranging(const struct device *dev, uint8_t ranging_id, const struct mtm_ranging_config *conf, struct dwt_ranging_frame_info **buffers);
+int      dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *conf, struct dwt_ranging_frame_info **buffers);
+int      dwt_mtm_ranging_estimate_duration(const struct device *dev, const struct mtm_ranging_config *conf);
 int      dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t node_id, uint16_t timeout_us, struct dwt_glossy_tx_result *result);
 
 void     dwt_set_antenna_delay_rx(const struct device *dev, uint16_t rx_delay_ts);
