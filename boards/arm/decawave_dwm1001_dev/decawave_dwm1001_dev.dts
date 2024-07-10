@@ -77,7 +77,6 @@
 		watchdog0 = &wdt0;
 		accel0     = &lis2dh12;
 	};
-
 };
 
 &adc {
@@ -98,7 +97,7 @@
 
 &uart0 {
 	status = "okay";
-	compatible = "nordic,nrf-uart";
+	compatible = "nordic,nrf-uarte";
 	current-speed = <115200>;
 	pinctrl-0 = <&uart0_default>;
 	pinctrl-1 = <&uart0_sleep>;
@@ -153,6 +152,16 @@
 		reg = <0>;
 	};
 };
+
+//&rtc0 {
+//        status = "okay";
+//  };
+
+// &systick {
+//  	/* Use RTC for system clock, instead of SysTick. */
+//  	status = "okay";
+// };
+
 
 &pwm0 {
 	status = "okay";
