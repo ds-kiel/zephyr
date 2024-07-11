@@ -705,7 +705,7 @@ static inline uint16_t dwt_fp_ampl3_from_info_reg(const struct dwt_rx_info_regs 
 }
 
 static inline uint16_t dwt_cir_pwr_from_info_reg(const struct dwt_rx_info_regs *rx_inf_reg) {
-	return sys_get_le16(rx_inf_reg->rx_fqual + DWT_RX_FQUAL_CIR_PWR_OFFSET);
+	return sys_get_le16(rx_inf_reg->rx_fqual + DWT_RX_FQUAL_FP_CIR_PWR_OFFSET);
 }
 
 
