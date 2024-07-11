@@ -104,10 +104,11 @@ struct dwt_ranging_frame_info {
 	} type;
 
 	uint32_t rx_pacc;
-	int8_t cir_pwr;
+	uint32_t cir_pwr;
 	uint16_t fp_index, fp_ampl1, fp_ampl2, fp_ampl3, std_noise;
 	uint8_t slot; // might be unecessary since we currently index the return array by the respective slot number
 	float cfo_ppm;
+	int8_t rx_level;
 
 	dwt_ts_t timestamp;
 };

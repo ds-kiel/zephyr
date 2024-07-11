@@ -705,7 +705,7 @@ static inline uint16_t dwt_fp_ampl3_from_info_reg(const struct dwt_rx_info_regs 
 }
 
 static inline uint16_t dwt_cir_pwr_from_info_reg(const struct dwt_rx_info_regs *rx_inf_reg) {
-	return sys_get_le16(rx_inf_reg->rx_fqual + DWT_RX_FQUAL_FP_CIR_PWR_OFFSET);
+	return sys_get_le16(&rx_inf_reg->rx_fqual[DWT_RX_FQUAL_FP_CIR_PWR_OFFSET]);
 }
 
 
@@ -3054,6 +3054,7 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 						incoming_frame_info->fp_ampl2 = dwt_fp_ampl2_from_info_reg(&rx_info);
 						incoming_frame_info->fp_ampl3 = dwt_fp_ampl3_from_info_reg(&rx_info);
 						incoming_frame_info->std_noise = dwt_std_noise_from_info_reg(&rx_info);
+						incoming_frame_info->rx_level = rx_level;
 
 						if(conf->cfo) {
 							// warning this has to be adjusted for other data rates.
