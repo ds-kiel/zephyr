@@ -63,7 +63,7 @@ struct mtm_ranging_config {
 
 	cir_memory_callback_t cir_handler;
 
-	uint8_t valid_fp_index_range;
+	uint16_t fp_index_threshold; // if reject frames is set, remove frames below this threshold
 	uint16_t timeout_us;
 	uint16_t cca_duration;
 };
