@@ -43,7 +43,7 @@ uint8_t *dwt_get_mac(const struct device *dev);
 struct mtm_ranging_timing {
 	uint64_t min_slot_length_us,
 		phy_activate_rx_delay,
-		phase_setup_delay,
+		phase_setup_delay, round_setup_delay,
 		preamble_chunk_duration;
 	uint16_t frame_timeout_period, preamble_timeout;
 };
@@ -51,10 +51,29 @@ struct mtm_ranging_timing {
 
 typedef int (*cir_memory_callback_t)(int slot, int phase, const uint8_t *cir_memory, size_t size);
 
+
+// Preactively wrap into structure in case more meta information will be included in the future.
+struct dense_slot {
+	enum slot_type {
+		DENSE_PREPARE_TX_BUFFER,
+		DENSE_RX_SLOT,
+		DENSE_TX_SLOT,
+	} type;
+};
+
+struct mtm_ranging_dense_slot_schedule {
+	uint16_t slot_count;
+	struct dense_slot *slots;
+};
+
 struct mtm_ranging_config {
 	uint8_t ranging_id;
-	uint8_t slots_per_phase, phases;
-	uint8_t tx_slot_offset;
+
+	/* uint8_t slots_per_phase, phases; */
+	/* uint8_t tx_slot_offset; */
+
+	struct mtm_ranging_dense_slot_schedule *schedule;
+
 	uint32_t slot_duration_us, guard_period_us;
 	uint64_t micro_slot_offset_ns;
 
@@ -83,9 +102,9 @@ struct __attribute__((__packed__)) dwt_ranging_frame_buffer {
 	uint8_t  prot_id;     // identifier that this is a MTM ranging protocol execution
 	uint8_t  msg_id;      // identifier of which message type during the protocol run we are sending
 	uint8_t  ranging_id;  // unique identifier of this node for ranging
-	uint8_t  rx_ts_count; // amount of received timestamps
 	dwt_packed_ts_t tx_ts;
 	dwt_packed_ts_t phase_start_ts; // this will eventually replace tx_ts.
+	uint8_t  rx_ts_count; // amount of received timestamps
 	struct dwt_tagged_timestamp rx_ts[15];   // for now allocate space for 10 timestamps
 };
 
