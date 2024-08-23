@@ -49,13 +49,13 @@ struct mtm_ranging_timing {
 };
 
 
-typedef int (*cir_memory_callback_t)(int slot, int phase, const uint8_t *cir_memory, size_t size);
+typedef int (*cir_memory_callback_t)(int slot, const uint8_t *cir_memory, size_t size);
 
 
 // Preactively wrap into structure in case more meta information will be included in the future.
 struct dense_slot {
 	enum slot_type {
-		DENSE_PREPARE_TX_BUFFER,
+		DENSE_LOAD_TX_BUFFER,
 		DENSE_RX_SLOT,
 		DENSE_TX_SLOT,
 	} type;
@@ -78,7 +78,7 @@ struct mtm_ranging_config {
 	uint64_t micro_slot_offset_ns;
 
 	// options
-	uint8_t use_initiation_frame, cca, reject_frames, cfo;
+	uint8_t use_initiation_frame, node_is_initiator, cca, reject_frames, cfo;
 
 	cir_memory_callback_t cir_handler;
 
@@ -95,15 +95,14 @@ void to_packed_dwt_ts(dwt_packed_ts_t ts, dwt_ts_t value);
 
 struct __attribute__((__packed__)) dwt_tagged_timestamp {
 	dwt_packed_ts_t ts;
-	uint8_t ranging_id;
+	uint8_t ranging_id, slot;
 };
 
+#warning "Add here a optional payload, this could be used for instance for the initial transmission frame as it will not yet contain any timestamp data. Useful for instance if we want to implement onboard positioning.".
 struct __attribute__((__packed__)) dwt_ranging_frame_buffer {
-	uint8_t  prot_id;     // identifier that this is a MTM ranging protocol execution
 	uint8_t  msg_id;      // identifier of which message type during the protocol run we are sending
 	uint8_t  ranging_id;  // unique identifier of this node for ranging
 	dwt_packed_ts_t tx_ts;
-	dwt_packed_ts_t phase_start_ts; // this will eventually replace tx_ts.
 	uint8_t  rx_ts_count; // amount of received timestamps
 	struct dwt_tagged_timestamp rx_ts[15];   // for now allocate space for 10 timestamps
 };
@@ -142,7 +141,7 @@ enum dwt_mtm_ranging_slot {
 	DWT_NO_TX_SLOT = 0xFF, // indicates that a node should not transmit during this round
 };
 
-int      dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *conf, struct dwt_ranging_frame_info **buffers);
+int      dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *conf, struct dwt_ranging_frame_info **buffers, int *frame_count);
 int      dwt_mtm_ranging_estimate_duration(const struct device *dev, const struct mtm_ranging_config *conf);
 int      dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t node_id, uint16_t timeout_us, struct dwt_glossy_tx_result *result);
 
