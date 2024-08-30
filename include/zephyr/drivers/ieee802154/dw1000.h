@@ -36,7 +36,7 @@ uint32_t dwt_fs_to_short_ts(uint64_t fs);
 uint64_t dwt_calculate_actual_tx_ts(uint32_t planned_short_ts, uint16_t tx_antenna_delay);
 void     dwt_set_frame_filter(const struct device *dev, bool ff_enable, uint8_t ff_type);
 uint8_t *dwt_get_mac(const struct device *dev);
-
+int dwt_calculate_slot_duration(const struct device *dev, int device_count, int guard_us);
 
 
 /** Ranging Utility Functions **/
@@ -49,6 +49,14 @@ struct mtm_ranging_timing {
 };
 
 
+/* This is platform specific and should be measured through ANALYZE_DWT_TIMING
+   directly in the driver implementation. You should start with a pessimistic slot duration and
+   afterward reduce the length depending on the measurement result.*/
+struct mtm_round_timing {
+	uint32_t round_init_us, initiation_frame_us, init_round_setup_us,
+		prepare_tx_us, prog_rx_ts_us, frame_handling_us, irq_handling_us;
+};
+
 typedef int (*cir_memory_callback_t)(int slot, const uint8_t *cir_memory, size_t size);
 
 
@@ -58,7 +66,16 @@ struct dense_slot {
 		DENSE_LOAD_TX_BUFFER,
 		DENSE_RX_SLOT,
 		DENSE_TX_SLOT,
+		DENSE_IDLE_SLOT,
 	} type;
+
+	union {
+		// Meta information for LOAD_TX_BUFFER
+		struct {
+			uint8_t *payload;
+			size_t payload_size;
+		};
+	} meta;
 };
 
 struct mtm_ranging_dense_slot_schedule {

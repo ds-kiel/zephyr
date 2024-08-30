@@ -32,7 +32,6 @@ LOG_MODULE_REGISTER(dw1000, LOG_LEVEL_INF);
 
 #define ZEPHYR_SPI 0
 #define SPIM       0
-#define EXTREMELY_LEAN_DRIVER 0
 
 #if ZEPHYR_SPI
 #include <zephyr/drivers/spi.h>
@@ -75,6 +74,49 @@ static bool spi_initialized;
 
 #define ANALYZE_DWT_TIMING 0
 #define USE_GPIO_DEBUG 1
+
+#if ANALYZE_DWT_TIMING
+struct timing_log {
+	char *label;
+	uint64_t timestamp_ns;
+};
+
+struct {
+	uint8_t count;
+	struct timing_log logs[100];
+} timing_logs = {
+	.count = 0,
+};
+
+#define SW_DEFINE(NAME) static timing_t dbts_start_##NAME = 0; static timing_t dbts_end_##NAME = 0;
+#define SW_START(NAME)  dbts_start_##NAME = timing_counter_get(); //k_cycle_get_32();
+#define SW_END(NAME)    do { dbts_end_##NAME = timing_counter_get(); timing_logs.logs[timing_logs.count].label = #NAME; timing_logs.logs[timing_logs.count].timestamp_ns = timing_cycles_to_ns(timing_cycles_get(&dbts_start_##NAME, &dbts_end_##NAME)); timing_logs.count++; } while(0)
+
+void reset_timing_logs() {
+	timing_logs.count = 0;
+}
+
+void output_timing_logs() {
+	for(int i = 0; i < timing_logs.count; i++) {
+		LOG_WRN("%s: %llu [us]", timing_logs.logs[i].label, timing_logs.logs[i].timestamp_ns / 1000);
+	}
+}
+
+#else
+#define SW_DEFINE(NAME)
+#define SW_START(NAME)
+#define SW_END(NAME)
+#endif
+
+SW_DEFINE(ROUND_INIT);
+SW_DEFINE(INITIATION_FRAME);
+SW_DEFINE(INIT_ROUND_SETUP);
+SW_DEFINE(PREPARE_TX);
+SW_DEFINE(PROG_RX_TX);
+SW_DEFINE(FRAME_HANDLING);
+SW_DEFINE(IRQ_WAIT_DELAY);
+SW_DEFINE(IRQ_HANDLING);
+
 
 #if USE_GPIO_DEBUG
 
@@ -959,7 +1001,7 @@ static inline void dwt_irq_minimal_rx_handler(const struct device *dev, uint32_t
 	ctx->phy_irq_event = DWT_IRQ_RX;
 }
 
-static void dwt_irq_handle_tx(const struct device *dev, uint32_t sys_stat)
+static inline void dwt_irq_handle_tx(const struct device *dev, uint32_t sys_stat)
 {
 	struct dwt_context *ctx = dev->data;
 
@@ -972,7 +1014,7 @@ static void dwt_irq_handle_tx(const struct device *dev, uint32_t sys_stat)
 	}
 }
 
-static void dwt_irq_handle_rxto(const struct device *dev, uint32_t sys_stat)
+static inline void dwt_irq_handle_rxto(const struct device *dev, uint32_t sys_stat)
 {
 	struct dwt_context *ctx = dev->data;
 
@@ -998,7 +1040,7 @@ static void dwt_irq_handle_rxto(const struct device *dev, uint32_t sys_stat)
 
 
 // Whole handler takes roughly 90us
-static void dwt_irq_handle_error(const struct device *dev, uint32_t sys_stat)
+static inline void dwt_irq_handle_error(const struct device *dev, uint32_t sys_stat)
 {
 	struct dwt_context *ctx = dev->data;
 	/* Clear RX error event bits */
@@ -1062,6 +1104,7 @@ static void dwt_irq_handle_half_delay(const struct device *dev, uint32_t sys_sta
 
 static void dwt_irq_work_handler(struct k_work *item)
 {
+	SW_START(IRQ_HANDLING);
 	struct dwt_context *ctx = CONTAINER_OF(item, struct dwt_context,
 					       irq_cb_work);
 	const struct device *dev = ctx->dev;
@@ -1102,8 +1145,6 @@ static void dwt_irq_work_handler(struct k_work *item)
 		dwt_irq_handle_error(dev, sys_stat);
 		free_phybet = 1;
 	}
-
-	ctx->phy_irq_sys_stat = sys_stat;
 
 	k_sem_give(&ctx->dev_lock);
 
@@ -1628,8 +1669,7 @@ static int dwt_start(const struct device *dev)
 
 	if (dwt_reg_read_u32(dev, DWT_DEV_ID_ID, 0) != DWT_DEVICE_ID) {
 		/* Keep SPI CS line low for 500 microseconds */
-		dwt_register_read(dev, 0, 0, sizeof(cswakeup_buf),
-				  cswakeup_buf);
+		dwt_register_read(dev, 0, 0, sizeof(cswakeup_buf), cswakeup_buf);
 		/* Give device time to initialize */
 		k_sleep(K_MSEC(5));
 
@@ -2440,6 +2480,27 @@ static int dw1000_init(const struct device *dev)
 
 	dwt_hw_reset(dev);
 
+	// first run wake up routine
+	dwt_set_spi_slow(dev, DWT_SPI_CSWAKEUP_FREQ);
+	uint8_t cswakeup_buf[32] = {0};
+	if (dwt_reg_read_u32(dev, DWT_DEV_ID_ID, 0) != DWT_DEVICE_ID) {
+		/* Keep SPI CS line low for 500 microseconds */
+		dwt_register_read(dev, 0, 0, sizeof(cswakeup_buf), cswakeup_buf);
+		/* Give device time to initialize */
+		k_sleep(K_MSEC(5));
+
+		if (dwt_reg_read_u32(dev, DWT_DEV_ID_ID, 0) != DWT_DEVICE_ID) {
+			LOG_ERR("Failed to wake-up %p", dev);
+			return -1;
+		}
+	} else {
+		LOG_WRN("Device not in a sleep mode");
+	}
+
+	/* Restore SPI clock settings */
+	dwt_set_spi_slow(dev, DWT_SPI_SLOW_FREQ);
+
+
 	if (dwt_reg_read_u32(dev, DWT_DEV_ID_ID, 0) != DWT_DEVICE_ID) {
 		LOG_ERR("Failed to read device ID %p", dev);
 		return -ENODEV;
@@ -2551,22 +2612,23 @@ static inline uint64_t dwt_read_tx_timestamp(const struct device *dev) {
 
 struct mtm_ranging_timing mtm_ranging_conf = {
 	.phy_activate_rx_delay = UUS_TO_DWT_TS(128 + 16),
-	/* .phy_activate_rx_delay = UUS_TO_DWT_TS(128),	 */
 	.phase_setup_delay = UUS_TO_DWT_TS(200),
 	.round_setup_delay = UUS_TO_DWT_TS(200),
-	.min_slot_length_us = 150,
 	.preamble_timeout = 128/8,
 	.preamble_chunk_duration = UUS_TO_DWT_TS(8), // 8 symbols per cross-correlated chunk
 };
 
 #warning "we don't receive the full 128 pacc symbols, is our timing completely correct here? Maybe check phy_activate_rx_delay again"
 
+#warning "Implement Glossy payload"
 struct __attribute__((__packed__)) dwt_glossy_frame_buffer {
 	uint8_t  prot_id;     // some identifier that this is a MTM ranging protocol execution
 	uint8_t  msg_id;      // some identifier of which message type during the protocol run we are sending
 	uint8_t  flood_initiator_id;      // some ranging id, in case of time slotted access this is equivalent to the transmission slot in the schedule
 	uint8_t hop_count;
-	uint64_t rtc_initiation_timestamp;
+	int64_t rtc_initiation_timestamp;
+	uint8_t payload_size;
+	uint8_t *payload;
 };
 
 struct mtm_glossy_setup_struct {
@@ -2589,8 +2651,8 @@ int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t
 	struct timeutil_sync_instant *rtc_inst = &result->clock_sync_instant;
 
 	int irq_state;
-	uint64_t initiator_rtc_ts, local_rtc_ts;
-	uint64_t transmission_ts;
+	int64_t initiator_rtc_ts, local_rtc_ts;
+	int64_t transmission_ts;
 	atomic_t old_state;
 
 	/* uint64_t psdu_duration_sans_preamble = dwt_get_pkt_duration_ns(ctx, sizeof(dwt_glossy_frame_buffer)) - */
@@ -2619,7 +2681,7 @@ int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t
 	if (initiator) {
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
 
-		initiator_rtc_ts = k_uptime_ticks();// + ((CONFIG_SYS_CLOCK_TICKS_PER_SEC * mtm_ranging_conf.initial_tx_delay_us) / 1000000);
+		initiator_rtc_ts = k_cycle_get_32();// + ((CONFIG_SYS_CLOCK_TICKS_PER_SEC * mtm_ranging_conf.initial_tx_delay_us) / 1000000);
 		transmission_ts = dwt_system_ts(dev) + UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us);
 
 		/* uint8_t buf[] = {DWT_MTM_PROTOCOL_ID, DWT_MTM_GLOSSY_TX_ID, node_id, hop}; */
@@ -2651,7 +2713,7 @@ int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t
 
 		if(irq_state == DWT_IRQ_RX) {
 			/* local_rtc_ts = k_uptime_ticks(); */
-			local_rtc_ts = k_uptime_ticks();
+			local_rtc_ts = k_cycle_get_32();
 			transmission_ts = dwt_system_ts(dev) + UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us);
 
 			// read received packet
@@ -2693,9 +2755,6 @@ int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t
 
 			k_sem_give(&ctx->dev_lock);
 			irq_state = wait_for_phy(dev);
-		} else {
-			ret = -EIO;
-			goto cleanup;
 		}
 	}
 
@@ -2714,6 +2773,10 @@ int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t
 	if(atomic_test_bit(&ctx->state, DWT_STATE_RX_DEF_ON)) {
 		dwt_enable_rx(dev, 0, 0);
 	}
+
+
+	// TODO See comment below in dwt_mtm_ranging
+	k_yield();
 
 	return ret;
 }
@@ -2745,77 +2808,40 @@ void to_packed_dwt_ts(dwt_packed_ts_t ts, dwt_ts_t value) {
 	ts[4] = (value >> 32) & 0xFF;
 }
 
-
-struct timing_log {
-	char *label;
-	uint64_t timestamp_ns;
+#warning "initiation frame is for now only calculated in case it is not send, why is it actually so long then??"
+struct mtm_round_timing timing = {
+	.round_init_us = 85,
+	.initiation_frame_us = 20,
+	.init_round_setup_us = 68,
+	.prepare_tx_us = 130, // DEPENDENCY ON NODES
+	.prog_rx_ts_us = 41,
+	.frame_handling_us = 230,
+	.irq_handling_us = 100,
 };
 
-struct {
-	uint8_t count;
-	struct timing_log logs[100];
-} timing_logs = {
-	.count = 0,
-};
+#warning "we have to include device_count dependency on the prepare_tx_us etc. here as well"
+int dwt_calculate_slot_duration(const struct device *dev, int device_count, int guard_us) {
+	struct dwt_context *ctx = dev->data;
+	struct mtm_round_timing *t = &timing;
 
+	int psdu_len = offsetof(struct dwt_ranging_frame_buffer, rx_ts) + (device_count * sizeof(struct dwt_tagged_timestamp));
+	int tx_duration_us = dwt_get_pkt_duration_ns(ctx, psdu_len)/1000;
 
-#if ANALYZE_DWT_TIMING
-#define SW_DEFINE(NAME) static timing_t dbts_start_##NAME = 0; static timing_t dbts_end_##NAME = 0;
-#define SW_START(NAME)  dbts_start_##NAME = timing_counter_get(); //k_cycle_get_32();
-#define SW_END(NAME)    do { dbts_end_##NAME = timing_counter_get(); timing_logs.logs[timing_logs.count].label = #NAME; timing_logs.logs[timing_logs.count].timestamp_ns = timing_cycles_to_ns(timing_cycles_get(&dbts_start_##NAME, &dbts_end_##NAME)); timing_logs.count++; } while(0)
+	int slot_length_us = MAX(tx_duration_us, MAX(t->prepare_tx_us, t->prog_rx_ts_us) + t->frame_handling_us) + t->irq_handling_us;
 
-void reset_timing_logs() {
-	timing_logs.count = 0;
+	return slot_length_us + guard_us;
 }
-
-void output_timing_logs() {
-	for(int i = 0; i < timing_logs.count; i++) {
-		LOG_WRN("%s: %llu [us]", timing_logs.logs[i].label, timing_logs.logs[i].timestamp_ns / 1000);
-	}
-}
-
-#else
-#define SW_DEFINE(NAME)
-#define SW_START(NAME)
-#define SW_END(NAME)
-#endif
-
-SW_DEFINE(ROUND_INIT);
-SW_DEFINE(INITIATION_FRAME);
-SW_DEFINE(INIT_ROUND_SETUP);
-SW_DEFINE(PREPARE_TX);
-SW_DEFINE(PROG_RX_TX);
-SW_DEFINE(FRAME_HANDLING);
-SW_DEFINE(IRQ_WAIT_DELAY);
-SW_DEFINE(IRQ_RX);
-
-
-struct measured_timing {
-	uint16_t reception_spi_read, packed_transmission_duration, transmission_enable;
-	uint16_t err_irq_handler;
-} measured_timing  = {
-	.packed_transmission_duration = 400,
-	.transmission_enable = 40,
-	.reception_spi_read = 330,
-	.err_irq_handler = 90,
-};
-
-
 
 // cca duration is again in units of pac size, i.e., generally for our setting it will be in the range of 1..16
 int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *conf, struct dwt_ranging_frame_info **frames, int *frame_count) {
-	int ret = 0;
+	int ret = 0, irq_state, frame_counter = 0, frame_info_counter = 0;
 	struct dwt_context *ctx = dev->data;
 	struct mtm_ranging_timing *ranging_conf = &mtm_ranging_conf;
-
 	struct mtm_ranging_dense_slot_schedule *schedule = conf->schedule;
 
-	int irq_state;
 	dwt_ts_t round_start_dw_ts, slot_start_ts, slot_duration;
 	uint16_t antenna_delay = ctx->tx_ant_dly;
 	atomic_t old_state;
-
-	int frame_counter = 0, frame_info_counter = 0;
 
 #if ANALYZE_DWT_TIMING
 	reset_timing_logs();
@@ -2823,15 +2849,7 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 #endif
 
 	SW_START(ROUND_INIT);
-
-
 	slot_duration = UUS_TO_DWT_TS(conf->slot_duration_us);
-
-	// check input arguments
-	if(conf->slot_duration_us < ranging_conf->min_slot_length_us) {
-		LOG_ERR("slot duration too short");
-		return -EINVAL;
-	}
 
 	// --- Prevent execution of multiple ranging tasks
 	if (atomic_test_and_set_bit(&ctx->state, DWT_STATE_TX)) {
@@ -2856,11 +2874,9 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 	dwt_double_buffering_align(dev); // for the following execution we require that host and receiver side are aligned
 	k_sem_give(&ctx->dev_lock);
 
-	/* LOG_WRN("estimated transmission duration %d us", dwt_get_pkt_duration_ns(ctx, sizeof(struct dwt_ranging_frame_buffer))/1000); */
-
 	SW_END(ROUND_INIT);
-	SW_START(INITIATION_FRAME);
 
+	SW_START(INITIATION_FRAME);
 	// --- Optional: Round Initiation ---
 	if (conf->use_initiation_frame) {
 		if (conf->node_is_initiator) {
@@ -2960,21 +2976,29 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 	outgoing_frame      = &ranging_frames[frame_counter];
 	outgoing_frame->rx_ts_count = 0;
 	frame_counter++;
-	SW_END(INIT_ROUND_SETUP);
+
 
 	uint8_t have_frame = 0;
 	uint16_t pkt_len;
 	int cfo;
 	// -- do one more iteration because of double buffered operation --
+	SW_END(INIT_ROUND_SETUP);
 	for(size_t s = 0; s < schedule->slot_count + 1; s++) {
-		enum slot_type type = schedule->slots[s].type;
+		enum slot_type type;
+
+		if(s < schedule->slot_count) {
+			type = schedule->slots[s].type;
+		} else {
+			type = DENSE_IDLE_SLOT;
+		}
 
 		// ---- I) kicking of next PHY action ----
-		if ((type == DENSE_RX_SLOT || type == DENSE_TX_SLOT) && s < schedule->slot_count) {
+		if ((type == DENSE_RX_SLOT || type == DENSE_TX_SLOT)) {
+			SW_START(PROG_RX_TX);
 			// --- Decide the PHY action to execute ---
 			k_sem_take(&ctx->dev_lock, K_FOREVER);
 			// --- schedule next PHY action ---
-			SW_START(PROG_RX_TX);
+
 			if(type == DENSE_TX_SLOT) {
 				dwt_fast_enable_tx(dev, (slot_start_ts
 						+ NS_TO_DWT_TS(conf->micro_slot_offset_ns)
@@ -2983,6 +3007,7 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 			} else if(type == DENSE_RX_SLOT) {
 				dwt_fast_enable_rx(dev, slot_start_ts & DWT_TS_MASK);
 			}
+			k_sem_give(&ctx->dev_lock);
 			SW_END(PROG_RX_TX);
 		}
 
@@ -3002,6 +3027,7 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 			uint16_t fp_index;
 			int fp_deviation;
 			float a_const;
+			k_sem_take(&ctx->dev_lock, K_FOREVER);
 
 			dwt_read_rx_info(dev, &rx_info);
 
@@ -3071,12 +3097,14 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 			}
 
 			dwt_switch_buffers(dev);
+
+			k_sem_give(&ctx->dev_lock);
 			have_frame = 0;
 			SW_END(FRAME_HANDLING);
 		}
 
 		// -- has to happen after frame handling, since the frame handler during double buffered operation may still add to the outgoing frame --
-		if(type == DENSE_LOAD_TX_BUFFER  && s < schedule->slot_count) {
+		if(type == DENSE_LOAD_TX_BUFFER) {
 			SW_START(PREPARE_TX);
 
 			dwt_ts_t current_frame_transmission_ts = slot_start_ts;
@@ -3144,10 +3172,8 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 			SW_END(PREPARE_TX);
 		}
 
-		k_sem_give(&ctx->dev_lock);
-
 		// ---- II) Joining with PHY (only relevant if our current slot is a rx or tx operation) -----
-		if ((type == DENSE_RX_SLOT || type == DENSE_TX_SLOT) && s < schedule->slot_count) {
+		if ((type == DENSE_RX_SLOT || type == DENSE_TX_SLOT)) {
 			SW_START(IRQ_WAIT_DELAY);
 			irq_state = wait_for_phy(dev);
 			SW_END(IRQ_WAIT_DELAY);
@@ -3172,7 +3198,6 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 				/* 	// nothing to do so far */
 				/* } */
 			} else if(irq_state == DWT_IRQ_RX) {
-				SW_START(IRQ_RX);
 				have_frame = 1;
 
 				// ----- NON DOUBLE BUFFERED REGS ------
@@ -3200,7 +3225,6 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 					conf->cir_handler(s, cir_acc_mem+2, 4064);
 				}
 #endif
-				SW_END(IRQ_RX);
 			} else if(irq_state == DWT_IRQ_TX) {
 			} else if(irq_state == DWT_IRQ_ERR) {
 				/* handling rx errors takes a longer time than the other
@@ -3213,6 +3237,7 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 				LOG_ERR("HALF_DELAY_WARNING");
 				goto cleanup;
 			}
+			SW_END(IRQ_HANDLING);
 		}
 
 		// -- Currently always iterate by slot_duration --
@@ -3243,6 +3268,17 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 	timing_stop();
 	output_timing_logs();
 #endif
+
+/* TODO hmm this is not really nice solution to a deeper problem. In some cases, for instance if we
+   are finishing our ranging schedule on a reception, another unexpected interrupt is
+   triggered. However, in the last slot, we are not yielding the execution of the current thread (in
+   this case the thread which called this function) since we do not call wait_for_phy
+   anymore. Normally this is not a problem as no interrupt should arrive, but in cases where one
+   arrives the interrupt work item will stall until the calling thread is suspended (for example by
+   going to sleep). This than causes the interrupt worker thread to be invoked when the receiver is
+   already in sleep, causing various other problems.
+ */
+	k_yield();
 
 	return ret;
 }

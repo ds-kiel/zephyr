@@ -415,7 +415,8 @@
 				    DWT_SYS_STATUS_RXFCG |  \
 				    DWT_SYS_STATUS_RXPRD |  \
 				    DWT_SYS_STATUS_RXSFDD | \
-				    DWT_SYS_STATUS_RXPHD)
+				    DWT_SYS_STATUS_RXPHD | \
+	                            DWT_SYS_STATUS_LDEDONE)
 /* All TX events mask. */
 #define DWT_SYS_STATUS_ALL_TX      (DWT_SYS_STATUS_AAT |   \
 				    DWT_SYS_STATUS_TXFRB | \
