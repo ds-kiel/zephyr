@@ -3230,11 +3230,16 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 				if(curr_slot->meta.with_cir_handler && conf->cir_handler != NULL) {
 					// first we do a bulk extract of the impulse memory
 					/* dwt_register_read(dev, DWT_ACC_MEM_ID, 0, sizeof(cir_acc_mem), cir_acc_mem); */
-					uint16_t to_index = curr_slot->meta.to_index, from_index = curr_slot->meta.from_index;
-
 					dwt_enable_accumulator_memory_access(dev);
-					char tx_buf[3] = {DWT_ACC_MEM_ID | DWT_SPI_TRANS_SUB_ADDR, DWT_SPI_TRANS_EXTEND_ADDR | (uint8_t)from_index & DWT_SPI_TRANS_SHORT_MAX_OFFSET, (uint8_t)(from_index >> 7)};
-					spi_transfer(tx_buf, sizeof(tx_buf), cir_acc_mem, (to_index - from_index + 1)*4 + 5); // 4096 is maximum amount we will ever grab here
+
+					uint16_t to_index = curr_slot->meta.to_index, from_index = curr_slot->meta.from_index;
+					uint16_t offset = from_index * 4;
+					uint8_t tx_buf[3] = {DWT_ACC_MEM_ID | DWT_SPI_TRANS_SUB_ADDR,
+						(uint8_t)(offset & DWT_SPI_TRANS_SHORT_MAX_OFFSET) | DWT_SPI_TRANS_EXTEND_ADDR,
+						(uint8_t)(offset >> 7)};
+
+// 4096 is maximum amount we will ever grab here, + 1 because there will always be one garbage byte
+					spi_transfer(tx_buf, sizeof(tx_buf), cir_acc_mem, (to_index - from_index + 1)*4 + sizeof(tx_buf) + 1);
 
 					/*
 					  We are not able to buffer the CIR for every reception in
@@ -3245,7 +3250,7 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 					*/
 					dwt_disable_accumulator_memory_access(dev);
 
-					conf->cir_handler(s, cir_acc_mem+5, (to_index - from_index + 1)*4);
+					conf->cir_handler(s, cir_acc_mem+4, (to_index - from_index + 1)*4);
 				}
 #endif
 			} else if(irq_state == DWT_IRQ_TX) {
