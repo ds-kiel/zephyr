@@ -195,7 +195,7 @@ static void setup_debug_gpios() {
 #define UWB_PHY_TDSYM_DATA_850K		1025.64
 #define UWB_PHY_TDSYM_DATA_6M8		128.21
 
-#define DWT_WORK_QUEUE_STACK_SIZE	512
+#define DWT_WORK_QUEUE_STACK_SIZE	1024
 
 #define DWT_OTP_DELAY_ADDR 0x1C
 
@@ -529,7 +529,7 @@ static int dwt_spi_write(const struct device *dev, uint16_t hdr_len, const uint8
 #endif
 
 
-
+static int log_spi = 0;
 /* See 2.2.1.2 Transaction formats of the SPI interface */
 static int dwt_spi_transfer(const struct device *dev,
 			    uint8_t reg, uint16_t offset,
@@ -1115,6 +1115,12 @@ static void dwt_irq_work_handler(struct k_work *item)
 
 	sys_stat = dwt_reg_read_u32(dev, DWT_SYS_STATUS_ID, 0);
 
+	if(log_spi) {
+		printk("b 0x%08x\n", sys_stat);
+	}
+
+
+	/* LOG_ERR("b 0x%08x", sys_stat); */
 	if (sys_stat & DWT_SYS_STATUS_RXFCG) {
 		if (atomic_test_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU)) {
 			dwt_irq_minimal_rx_handler(dev, sys_stat);
@@ -1662,6 +1668,8 @@ static int dwt_start(const struct device *dev)
 	struct dwt_context *ctx = dev->data;
 	uint8_t cswakeup_buf[32] = {0};
 
+	log_spi = 0;
+
 	k_sem_take(&ctx->dev_lock, K_FOREVER);
 
 	/* Set SPI clock to lowest frequency */
@@ -1711,17 +1719,28 @@ static int dwt_stop(const struct device *dev)
 {
 	struct dwt_context *ctx = dev->data;
 
+	if(k_work_is_pending(&ctx->irq_cb_work)) {
+		/* log_spi = 1; */
+		/* k_yield(); */
+		LOG_ERR("IRQ work is still pending");
+	}
+
 	k_sem_take(&ctx->dev_lock, K_FOREVER);
 	dwt_disable_txrx(dev);
 	dwt_reset_rfrx(dev);
 	dwt_setup_int(dev, false);
 
+
 	/* Copy the user configuration and enter sleep mode */
+	dwt_reg_write_u8(dev, DWT_AON_ID, DWT_AON_CTRL_OFFSET, 0x00); // copied from official decawave driver source
 	dwt_reg_write_u8(dev, DWT_AON_ID, DWT_AON_CTRL_OFFSET,
 			 DWT_AON_CTRL_SAVE);
 	k_sem_give(&ctx->dev_lock);
 
-	LOG_INF("Stopped %p", dev);
+	if(k_work_is_pending(&ctx->irq_cb_work)) {
+		LOG_ERR("IRQ work is still pending");
+	}
+
 
 	return 0;
 }
@@ -2793,7 +2812,7 @@ static struct dwt_ranging_frame_info frame_infos[DWT_MTM_MAX_ROUND_LENGTH * DWT_
 // we will directly insert the header into the buffer, because of the limitiations of using nrfx spi
 // directly .Write into this buffer starting from offset 0, but read into it simultanously from
 // offset 1
-static uint8_t cir_acc_mem[4066];
+static uint8_t cir_acc_mem[4069];
 #endif
 
 dwt_ts_t from_packed_dwt_ts(const dwt_packed_ts_t ts) {
@@ -2984,10 +3003,11 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 	// -- do one more iteration because of double buffered operation --
 	SW_END(INIT_ROUND_SETUP);
 	for(size_t s = 0; s < schedule->slot_count + 1; s++) {
+		struct dense_slot *curr_slot = &schedule->slots[s];
 		enum slot_type type;
 
 		if(s < schedule->slot_count) {
-			type = schedule->slots[s].type;
+			type = curr_slot->type;
 		} else {
 			type = DENSE_IDLE_SLOT;
 		}
@@ -3112,12 +3132,13 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 
 			// seek next transmission slot
 			for(size_t i = s+1; i < schedule->slot_count; i++) {
+				struct dense_slot *next_slot = &schedule->slots[i];
 				// later in case we want to have differently sized slots, we can further distinguish here
-				if(schedule->slots[i].type == DENSE_TX_SLOT || schedule->slots[i].type == DENSE_RX_SLOT || schedule->slots[i].type == DENSE_LOAD_TX_BUFFER) {
+				if(next_slot->type == DENSE_TX_SLOT || next_slot->type == DENSE_RX_SLOT || next_slot->type == DENSE_LOAD_TX_BUFFER) {
 					current_frame_transmission_ts += slot_duration;
 				}
 
-				if(schedule->slots[i].type == DENSE_TX_SLOT) {
+				if(next_slot->type == DENSE_TX_SLOT) {
 					future_tx_slot = i;
 					break;
 				}
@@ -3206,23 +3227,25 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 					cfo = dwt_readcarrierintegrator(dev);
 				}
 #if CONFIG_DWT_MTM_OUTPUT_CIR
-				if(conf->cir_handler != NULL) {
+				if(curr_slot->meta.with_cir_handler && conf->cir_handler != NULL) {
 					// first we do a bulk extract of the impulse memory
 					/* dwt_register_read(dev, DWT_ACC_MEM_ID, 0, sizeof(cir_acc_mem), cir_acc_mem); */
+					uint16_t to_index = curr_slot->meta.to_index, from_index = curr_slot->meta.from_index;
+
 					dwt_enable_accumulator_memory_access(dev);
-					char tx_buf[1] = {DWT_ACC_MEM_ID};
-					spi_transfer(tx_buf, 1, cir_acc_mem, 4066);
+					char tx_buf[3] = {DWT_ACC_MEM_ID | DWT_SPI_TRANS_SUB_ADDR, DWT_SPI_TRANS_EXTEND_ADDR | (uint8_t)from_index & DWT_SPI_TRANS_SHORT_MAX_OFFSET, (uint8_t)(from_index >> 7)};
+					spi_transfer(tx_buf, sizeof(tx_buf), cir_acc_mem, (to_index - from_index + 1)*4 + 5); // 4096 is maximum amount we will ever grab here
 
-					// We are not able to buffer the CIR for every
-					// reception in the round. Therefore, we directly
-					// call a upper-layer handler for the cir This might
-					// also be useful in the future since the upper
-					// layer might want to decide whether to throw away
-					// the transmission based on the cir.
-
+					/*
+					  We are not able to buffer the CIR for every reception in
+					   the round. Therefore, we directly call a upper-layer
+					   handler for the cir This might also be useful in the
+					   future since the upper layer might want to decide whether
+					   to throw away the transmission based on the cir.
+					*/
 					dwt_disable_accumulator_memory_access(dev);
 
-					conf->cir_handler(s, cir_acc_mem+2, 4064);
+					conf->cir_handler(s, cir_acc_mem+5, (to_index - from_index + 1)*4);
 				}
 #endif
 			} else if(irq_state == DWT_IRQ_TX) {

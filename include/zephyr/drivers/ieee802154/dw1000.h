@@ -75,6 +75,12 @@ struct dense_slot {
 			uint8_t *payload;
 			size_t payload_size;
 		};
+
+		// Meta information for rx
+		struct {
+			bool with_cir_handler;
+			uint16_t from_index, to_index;
+		};
 	} meta;
 };
 
