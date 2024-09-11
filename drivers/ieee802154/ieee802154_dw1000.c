@@ -937,7 +937,7 @@ static inline void dwt_irq_handle_rx(const struct device *dev, uint32_t sys_stat
 
 #if defined(CONFIG_NEWLIB_LIBC)
 		/* From 4.7.2 Estimating the receive signal power */
-		rx_level = 10.0 * log10f(cir_pwr * BIT(17) /
+		rx_level = 10.0f * log10f(cir_pwr * BIT(17) /
 					 (rx_pacc * rx_pacc)) - a_const;
 #endif
 	}
@@ -2410,9 +2410,9 @@ static bool dwt_spi_init(const struct device *dev)
 
 	/* ret = pinctrl_apply_state(ctx->pcfg, PINCTRL_STATE_DEFAULT); */
 
-	if (ret < 0) {
-		return ret;
-	}
+	/* if (ret < 0) { */
+	/* 	return ret; */
+	/* } */
 
 #if SPIM
 	err = nrfx_spim_init(&spi, &ctx->spi_cfg, spi_handler, NULL);
@@ -2843,7 +2843,7 @@ int dwt_calculate_slot_duration(const struct device *dev, int device_count, int 
 	struct dwt_context *ctx = dev->data;
 	struct mtm_round_timing *t = &timing;
 
-	int psdu_len = offsetof(struct dwt_ranging_frame_buffer, rx_ts) + (device_count * sizeof(struct dwt_tagged_timestamp));
+	int psdu_len = offsetof(struct dwt_ranging_frame_buffer, payload) + (device_count * sizeof(struct dwt_tagged_timestamp));
 	int tx_duration_us = dwt_get_pkt_duration_ns(ctx, psdu_len)/1000;
 
 	int slot_length_us = MAX(tx_duration_us, MAX(t->prepare_tx_us, t->prog_rx_ts_us) + t->frame_handling_us) + t->irq_handling_us;
@@ -3066,7 +3066,7 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 				a_const = DWT_RX_SIG_PWR_A_CONST_PRF64;
 			}
 
-			rx_level = 10.0 * log10f(cir_pwr * BIT(17) /
+			rx_level = 10.0f * log10f(cir_pwr * BIT(17) /
 				(rx_pacc * rx_pacc)) - a_const;
 
 			bias_correction = get_range_bias_by_rssi(rx_level);
@@ -3101,17 +3101,19 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 
 				if(conf->cfo) {
 					// warning this has to be adjusted for other data rates. -1e6 * (((((float) cfo)) / (((float) (2 * 1024) / 998.4e6) * 2^17)) / 6489.6e6)
-					incoming_frame_info->cfo_ppm = (float) cfo * -0.000573121584378756;
+					incoming_frame_info->cfo_ppm = (float) cfo * -0.000573121584378756f;
 				}
 
 				// --- update outgoing frame ---
 				if(conf->reject_frames && ((int) fp_index >> 6) <= conf->fp_index_threshold) {
 					// this informs the upper layer that the frame was rejected and not included in the outgoing frame
 					incoming_frame_info->status = DWT_MTM_FRAME_REJECTED;
-				} else if(outgoing_frame && outgoing_frame->rx_ts_count < sizeof(outgoing_frame->rx_ts)/sizeof(struct dwt_tagged_timestamp)) {
-					to_packed_dwt_ts(outgoing_frame->rx_ts[outgoing_frame->rx_ts_count].ts, reception_ts - bias_correction);
-					outgoing_frame->rx_ts[outgoing_frame->rx_ts_count].ranging_id = incoming_frame->ranging_id;
-					outgoing_frame->rx_ts[outgoing_frame->rx_ts_count].slot = s - 1;
+				} else if(outgoing_frame && outgoing_frame->rx_ts_count < sizeof(outgoing_frame->payload)/sizeof(struct dwt_tagged_timestamp)) {
+					struct dwt_tagged_timestamp *curr_rx_ts = &((struct dwt_tagged_timestamp*) outgoing_frame->payload)[outgoing_frame->rx_ts_count];
+					to_packed_dwt_ts(curr_rx_ts->ts, reception_ts - bias_correction);
+					curr_rx_ts->ranging_id = incoming_frame->ranging_id;
+					curr_rx_ts->slot = s - 1;
+
 					outgoing_frame->rx_ts_count++;
 				}
 			}
@@ -3126,6 +3128,18 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 		// -- has to happen after frame handling, since the frame handler during double buffered operation may still add to the outgoing frame --
 		if(type == DENSE_LOAD_TX_BUFFER) {
 			SW_START(PREPARE_TX);
+
+			// check if we have a payload which we should include in this frame
+			if(curr_slot->meta.payload != NULL && curr_slot->meta.payload_size >= 0) {
+				// check how much space is available in frame for additional data
+				uint8_t occupied_space = (outgoing_frame->rx_ts_count * sizeof(struct dwt_tagged_timestamp));
+				if (curr_slot->meta.payload_size > sizeof(outgoing_frame->payload) - occupied_space) {
+					LOG_ERR("payload size too high");
+				}
+
+				outgoing_frame->payload_size = curr_slot->meta.payload_size;
+				memcpy(outgoing_frame->payload + occupied_space, curr_slot->meta.payload, curr_slot->meta.payload_size);
+			}
 
 			dwt_ts_t current_frame_transmission_ts = slot_start_ts;
 			uint16_t future_tx_slot = UINT16_MAX;
@@ -3169,8 +3183,8 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 				// --- finally load frame into transmission buffer ---
 				k_sem_take(&ctx->dev_lock, K_FOREVER);
 				setup_tx_frame(dev, (uint8_t*) outgoing_frame,
-					offsetof(struct dwt_ranging_frame_buffer, rx_ts)
-					+ (outgoing_frame->rx_ts_count * sizeof(struct dwt_tagged_timestamp)));
+					offsetof(struct dwt_ranging_frame_buffer, payload)
+					+ (outgoing_frame->rx_ts_count * sizeof(struct dwt_tagged_timestamp)) + outgoing_frame->payload_size);
 
 				k_sem_give(&ctx->dev_lock);
 

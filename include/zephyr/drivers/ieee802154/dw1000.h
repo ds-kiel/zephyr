@@ -121,13 +121,16 @@ struct __attribute__((__packed__)) dwt_tagged_timestamp {
 	uint8_t ranging_id, slot;
 };
 
+#define DWT_RANGING_FRAME_PAYLOAD_OFFSET(FRAME) (FRAME->payload + sizeof(struct dwt_tagged_timestamp) * FRAME->rx_ts_count)
+
 #warning "Add here a optional payload, this could be used for instance for the initial transmission frame as it will not yet contain any timestamp data. Useful for instance if we want to implement onboard positioning.".
 struct __attribute__((__packed__)) dwt_ranging_frame_buffer {
 	uint8_t  msg_id;      // identifier of which message type during the protocol run we are sending
 	uint8_t  ranging_id;  // unique identifier of this node for ranging
 	dwt_packed_ts_t tx_ts;
 	uint8_t  rx_ts_count; // amount of received timestamps
-	struct dwt_tagged_timestamp rx_ts[15];   // for now allocate space for 10 timestamps
+	uint8_t  payload_size;
+	uint8_t payload[110]; // payload will be located AFTER reception timestamps
 };
 
 enum dwt_ranging_frame_status {
