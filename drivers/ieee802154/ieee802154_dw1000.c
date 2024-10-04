@@ -333,7 +333,7 @@ struct dwt_rx_info_regs {
 #define RANGE_CORR_MAX_RSSI (-61)
 #define RANGE_CORR_MIN_RSSI (-93)
 
-int8_t range_bias_by_rssi[RANGE_CORR_MAX_RSSI-RANGE_CORR_MIN_RSSI+1] = {
+static int8_t range_bias_by_rssi[RANGE_CORR_MAX_RSSI-RANGE_CORR_MIN_RSSI+1] = {
     -23, // -61dBm (-11 cm)
     -23, // -62dBm (-10.75 cm)
     -22, // -63dBm (-10.5 cm)
@@ -3045,7 +3045,6 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 			int8_t rx_level = INT8_MIN, bias_correction;
 			uint32_t rx_pacc, cir_pwr;
 			uint16_t fp_index;
-			int fp_deviation;
 			float a_const;
 			k_sem_take(&ctx->dev_lock, K_FOREVER);
 
