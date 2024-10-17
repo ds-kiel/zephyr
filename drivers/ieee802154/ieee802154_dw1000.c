@@ -2661,8 +2661,7 @@ struct mtm_glossy_setup_struct {
 #define DWT_MTM_START_FRAME_ID 0x01
 #define DWT_MTM_RANGIN_FRAME_ID 0x02
 #define DWT_MTM_GLOSSY_TX_ID 0x03
-#define DWT_MTM_MAX_ROUND_LENGTH 15
-#define DWT_MTM_MAX_REPETITIONS 3
+#define DWT_MTM_MAX_FRAMES 100
 
 int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t node_id, uint16_t timeout_us, struct dwt_glossy_tx_result *result) {
 	int ret = 0;
@@ -2805,8 +2804,8 @@ int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t
 // but it will fail after having to free 10 nodes -> Update: fixed this i am stupid and c should have optional access bound checking on arrays...
 /* K_HEAP_DEFINE(dwt_ranging_result_buf, sizeof(struct dwt_ranging_frame_buffer)*100); */
 
-static struct dwt_ranging_frame_buffer ranging_frames[DWT_MTM_MAX_ROUND_LENGTH * DWT_MTM_MAX_REPETITIONS];
-static struct dwt_ranging_frame_info frame_infos[DWT_MTM_MAX_ROUND_LENGTH * DWT_MTM_MAX_REPETITIONS];
+static struct dwt_ranging_frame_buffer ranging_frames[DWT_MTM_MAX_FRAMES];
+static struct dwt_ranging_frame_info frame_infos[DWT_MTM_MAX_FRAMES];
 
 #if CONFIG_DWT_MTM_OUTPUT_CIR
 // we will directly insert the header into the buffer, because of the limitiations of using nrfx spi
@@ -2883,7 +2882,7 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 	atomic_set_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU);
 	atomic_clear_bit(&ctx->state, DWT_STATE_RX_DEF_ON);
 
-	for(int i = 0; i < DWT_MTM_MAX_ROUND_LENGTH * DWT_MTM_MAX_REPETITIONS; i++) {
+	for(int i = 0; i < DWT_MTM_MAX_FRAMES; i++) {
 		frame_infos[i].frame = NULL;
 	}
 
