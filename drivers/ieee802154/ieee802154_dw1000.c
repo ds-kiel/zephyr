@@ -2205,6 +2205,9 @@ static int dwt_configure_rf_phy(const struct device *dev)
 	dwt_reg_write_u8(dev, DWT_LDE_IF_ID, DWT_LDE_CFG1_OFFSET,
 			 DWT_DEFAULT_LDE_CFG1);
 
+#warning "EXPERIMENTATION WITH NTM value for random access outlier detection"
+	/* dwt_reg_write_u8(dev, DWT_LDE_IF_ID, DWT_LDE_CFG1_OFFSET, ((3 << 5) | 30)); */
+
 	if (rf_cfg->prf == DWT_PRF_64M) {
 		dwt_reg_write_u16(dev, DWT_LDE_IF_ID, DWT_LDE_CFG2_OFFSET,
 				  DWT_DEFAULT_LDE_CFG2_PRF64);
@@ -2646,6 +2649,7 @@ struct __attribute__((__packed__)) dwt_glossy_frame_buffer {
 	uint8_t  flood_initiator_id;      // some ranging id, in case of time slotted access this is equivalent to the transmission slot in the schedule
 	uint8_t hop_count;
 	int64_t rtc_initiation_timestamp;
+	dwt_ts_t dwt_initiation_timestamp;
 	uint8_t payload_size;
 	uint8_t *payload;
 };
@@ -2663,14 +2667,17 @@ struct mtm_glossy_setup_struct {
 #define DWT_MTM_GLOSSY_TX_ID 0x03
 #define DWT_MTM_MAX_FRAMES 100
 
-int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t node_id, uint16_t timeout_us, struct dwt_glossy_tx_result *result) {
+int dwt_glossy_tx_timesync(const struct  device *dev,
+	uint8_t initiator, uint8_t node_id, uint16_t timeout_us,
+	struct dwt_glossy_tx_result *result) {
 	int ret = 0;
 	struct dwt_context *ctx = dev->data;
-	struct timeutil_sync_instant *rtc_inst = &result->clock_sync_instant;
+	struct timeutil_sync_instant *rtc_inst = &result->rtc_clock_sync_instant;
+	struct timeutil_sync_instant *dwt_inst = &result->dwt_clock_sync_instant;
 
 	int irq_state;
 	int64_t initiator_rtc_ts, local_rtc_ts;
-	int64_t transmission_ts;
+	dwt_ts_t initiator_dwt_ts, local_dwt_ts;
 	atomic_t old_state;
 
 	/* uint64_t psdu_duration_sans_preamble = dwt_get_pkt_duration_ns(ctx, sizeof(dwt_glossy_frame_buffer)) - */
@@ -2700,7 +2707,7 @@ int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
 
 		initiator_rtc_ts = k_cycle_get_32();// + ((CONFIG_SYS_CLOCK_TICKS_PER_SEC * mtm_ranging_conf.initial_tx_delay_us) / 1000000);
-		transmission_ts = dwt_system_ts(dev) + UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us);
+		initiator_dwt_ts = dwt_system_ts(dev) + UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us);
 
 		/* uint8_t buf[] = {DWT_MTM_PROTOCOL_ID, DWT_MTM_GLOSSY_TX_ID, node_id, hop}; */
 		struct dwt_glossy_frame_buffer initial_glossy_frame = {
@@ -2708,15 +2715,18 @@ int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t
 			.msg_id = DWT_MTM_GLOSSY_TX_ID,
 			.flood_initiator_id = node_id,
 			.hop_count = 0,
-			.rtc_initiation_timestamp = initiator_rtc_ts
+			.rtc_initiation_timestamp = initiator_rtc_ts,
+			.dwt_initiation_timestamp = initiator_dwt_ts,
 		};
 
 		setup_tx_frame(dev, (uint8_t *)&initial_glossy_frame, sizeof(struct dwt_glossy_frame_buffer));
 
-		dwt_fast_enable_tx(dev, transmission_ts & DWT_TS_MASK);
+		dwt_fast_enable_tx(dev, initiator_dwt_ts & DWT_TS_MASK);
 
 		rtc_inst->ref = initiator_rtc_ts;
 		rtc_inst->local = initiator_rtc_ts;
+		dwt_inst->ref = initiator_dwt_ts;
+		dwt_inst->local = initiator_dwt_ts;
 		result->dist_to_root = 0; // i am groot
 
 		k_sem_give(&ctx->dev_lock);
@@ -2732,7 +2742,7 @@ int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t
 		if(irq_state == DWT_IRQ_RX) {
 			/* local_rtc_ts = k_uptime_ticks(); */
 			local_rtc_ts = k_cycle_get_32();
-			transmission_ts = dwt_system_ts(dev) + UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us);
+			initiator_dwt_ts = dwt_system_ts(dev) + UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us);
 
 			// read received packet
 			struct dwt_rx_info_regs rx_info;
@@ -2761,12 +2771,15 @@ int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t
 			glossy_frame.hop_count++;
 			setup_tx_frame(dev, (uint8_t *)&glossy_frame, sizeof(struct dwt_glossy_frame_buffer));
 
-			dwt_fast_enable_tx(dev, transmission_ts & DWT_TS_MASK);
+			dwt_fast_enable_tx(dev, initiator_dwt_ts & DWT_TS_MASK);
 			// now we have some time for doing further work on the mcu without affecting the timing above
-			initiator_rtc_ts = glossy_frame.rtc_initiation_timestamp;
 
-			rtc_inst->ref = initiator_rtc_ts;
+			local_dwt_ts = dwt_rx_timestamp_from_rx_info(&rx_info);
+
+			rtc_inst->ref = glossy_frame.rtc_initiation_timestamp;
 			rtc_inst->local = local_rtc_ts - (glossy_frame.hop_count * (uint64_t) (mtm_glossy_conf.transmission_delay_us + 152) * CONFIG_SYS_CLOCK_TICKS_PER_SEC) / 1000000 ;
+			dwt_inst->ref = glossy_frame.dwt_initiation_timestamp;
+			dwt_inst->local = local_dwt_ts - glossy_frame.hop_count * (uint64_t) UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us);
 			result->dist_to_root = glossy_frame.hop_count;
 
 			dwt_switch_buffers(dev);
@@ -2779,7 +2792,12 @@ int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t
 	if(irq_state == DWT_IRQ_ERR) {
 		ret = -EIO;
 		goto cleanup;
+	} else if (irq_state == DWT_IRQ_FRAME_WAIT_TIMEOUT ||
+		   irq_state == DWT_IRQ_PREAMBLE_DETECT_TIMEOUT) {
+		ret = -ETIMEDOUT;
+		goto cleanup;
 	}
+
 
   cleanup:
 	// --- clear bits ----
@@ -2791,7 +2809,6 @@ int dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t
 	if(atomic_test_bit(&ctx->state, DWT_STATE_RX_DEF_ON)) {
 		dwt_enable_rx(dev, 0, 0);
 	}
-
 
 	// TODO See comment below in dwt_mtm_ranging
 	k_yield();
@@ -2896,75 +2913,8 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 
 	SW_START(INITIATION_FRAME);
 	// --- Optional: Round Initiation ---
-	if (conf->use_initiation_frame) {
-		if (conf->node_is_initiator) {
-			k_sem_take(&ctx->dev_lock, K_FOREVER);
-
-			static uint8_t buf[2] = {DWT_MTM_PROTOCOL_ID, DWT_MTM_START_FRAME_ID};
-
-			setup_tx_frame(dev, buf, sizeof(buf));
-			dwt_fast_enable_tx(dev, 0);
-
-			k_sem_give(&ctx->dev_lock);
-
-			irq_state = wait_for_phy(dev);
-
-			if(irq_state != DWT_IRQ_TX) {
-				LOG_ERR("failed to send initiation frame");
-				ret = -EIO;
-				goto cleanup;
-			}
-
-			k_sem_take(&ctx->dev_lock, K_FOREVER);
-			round_start_dw_ts = dwt_read_tx_timestamp(dev);
-			k_sem_give(&ctx->dev_lock);
-		} else {
-			k_sem_take(&ctx->dev_lock, K_FOREVER);
-			dwt_enable_rx(dev, conf->timeout_us, 0);
-			k_sem_give(&ctx->dev_lock);
-
-			irq_state = wait_for_phy(dev);
-
-			if(irq_state == DWT_IRQ_RX) {
-				struct dwt_rx_info_regs rx_info;
-				k_sem_take(&ctx->dev_lock, K_FOREVER);
-
-				dwt_read_rx_info(dev, &rx_info);
-				round_start_dw_ts = dwt_rx_timestamp_from_rx_info(&rx_info);
-
-				// read received packet
-				uint32_t rx_finfo;
-				uint16_t pkt_len;
-				rx_finfo = dwt_reg_read_u32(dev, DWT_RX_FINFO_ID, DWT_RX_FINFO_OFFSET);
-				pkt_len = rx_finfo & DWT_RX_FINFO_RXFLEN_MASK;
-
-				uint8_t buf[2];
-				if((pkt_len-2) != sizeof(buf)) {
-					LOG_ERR("invalid start of round frame, wrong length (%u bytes)", pkt_len);
-					/* dwt_switch_buffers(dev); */ // should not be needed because we align the buffers anyway
-					k_sem_give(&ctx->dev_lock);
-					ret = -EIO;
-					goto cleanup;
-				}
-
-				dwt_register_read(dev, DWT_RX_BUFFER_ID, 0, pkt_len, buf);
-
-				dwt_switch_buffers(dev);
-
-				if(buf[0] != DWT_MTM_PROTOCOL_ID || buf[1] != DWT_MTM_START_FRAME_ID) {
-					LOG_ERR("invalid start of round frame, wrong protocol id");
-					k_sem_give(&ctx->dev_lock);
-					ret = -EIO;
-					goto cleanup;
-				}
-
-				k_sem_give(&ctx->dev_lock);
-			} else {
-				LOG_ERR("failed to receive initiation frame (%u)", irq_state);
-				ret = -EIO;
-				goto cleanup;
-			}
-		}
+	if (conf->dwt_clock_sync_instant != NULL) {
+		round_start_dw_ts = conf->dwt_clock_sync_instant->local + UUS_TO_DWT_TS(conf->round_start_offset_us);
 	} else {
 		// use current transmission timestamp and configuration with guard periods
 		round_start_dw_ts = dwt_system_ts(dev);

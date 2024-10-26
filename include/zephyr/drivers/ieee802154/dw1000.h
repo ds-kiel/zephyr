@@ -92,16 +92,15 @@ struct mtm_ranging_dense_slot_schedule {
 struct mtm_ranging_config {
 	uint8_t ranging_id;
 
-	/* uint8_t slots_per_phase, phases; */
-	/* uint8_t tx_slot_offset; */
-
 	struct mtm_ranging_dense_slot_schedule *schedule;
+	struct timeutil_sync_instant *dwt_clock_sync_instant;
+	uint16_t round_start_offset_us; // only relevant if time sync instant is used
 
 	uint32_t slot_duration_us, guard_period_us;
 	uint64_t micro_slot_offset_ns;
 
 	// options
-	uint8_t use_initiation_frame, node_is_initiator, cca, reject_frames, cfo;
+	uint8_t cca, reject_frames, cfo;
 
 	cir_memory_callback_t cir_handler;
 
@@ -156,7 +155,8 @@ struct dwt_ranging_frame_info {
 };
 
 struct dwt_glossy_tx_result {
-	struct timeutil_sync_instant clock_sync_instant;
+	struct timeutil_sync_instant rtc_clock_sync_instant;
+	struct timeutil_sync_instant dwt_clock_sync_instant;
 	uint8_t dist_to_root; // aka hop counter
 };
 
