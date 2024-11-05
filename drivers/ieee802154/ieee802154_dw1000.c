@@ -27,7 +27,6 @@ LOG_MODULE_REGISTER(dw1000, LOG_LEVEL_INF);
 #include <stdlib.h>
 #include <zephyr/timing/timing.h>
 
-
 #include <zephyr/drivers/gpio.h>
 
 #define ZEPHYR_SPI 0
@@ -2707,7 +2706,7 @@ int dwt_glossy_tx_timesync(const struct  device *dev,
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
 
 		initiator_rtc_ts = k_cycle_get_32();// + ((CONFIG_SYS_CLOCK_TICKS_PER_SEC * mtm_ranging_conf.initial_tx_delay_us) / 1000000);
-		initiator_dwt_ts = dwt_system_ts(dev) + UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us);
+		initiator_dwt_ts = (dwt_system_ts(dev) + UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us)) % DWT_TS_MASK;
 
 		/* uint8_t buf[] = {DWT_MTM_PROTOCOL_ID, DWT_MTM_GLOSSY_TX_ID, node_id, hop}; */
 		struct dwt_glossy_frame_buffer initial_glossy_frame = {
@@ -2723,9 +2722,9 @@ int dwt_glossy_tx_timesync(const struct  device *dev,
 
 		dwt_fast_enable_tx(dev, initiator_dwt_ts & DWT_TS_MASK);
 
-		rtc_inst->ref = initiator_rtc_ts;
+		rtc_inst->ref   = initiator_rtc_ts;
 		rtc_inst->local = initiator_rtc_ts;
-		dwt_inst->ref = initiator_dwt_ts;
+		dwt_inst->ref   = initiator_dwt_ts;
 		dwt_inst->local = initiator_dwt_ts;
 		result->dist_to_root = 0; // i am groot
 
@@ -2742,7 +2741,6 @@ int dwt_glossy_tx_timesync(const struct  device *dev,
 		if(irq_state == DWT_IRQ_RX) {
 			/* local_rtc_ts = k_uptime_ticks(); */
 			local_rtc_ts = k_cycle_get_32();
-			initiator_dwt_ts = dwt_system_ts(dev) + UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us);
 
 			// read received packet
 			struct dwt_rx_info_regs rx_info;
@@ -2769,17 +2767,20 @@ int dwt_glossy_tx_timesync(const struct  device *dev,
 			}
 
 			glossy_frame.hop_count++;
-			setup_tx_frame(dev, (uint8_t *)&glossy_frame, sizeof(struct dwt_glossy_frame_buffer));
-
-			dwt_fast_enable_tx(dev, initiator_dwt_ts & DWT_TS_MASK);
-			// now we have some time for doing further work on the mcu without affecting the timing above
-
 			local_dwt_ts = dwt_rx_timestamp_from_rx_info(&rx_info);
 
+			setup_tx_frame(dev, (uint8_t *)&glossy_frame, sizeof(struct dwt_glossy_frame_buffer));
+			dwt_fast_enable_tx(dev, (local_dwt_ts + UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us)) % DWT_TS_MASK);
+			// now we have some time for doing further work on the mcu without affecting the timing above
+
+			// read from glossy frame
 			rtc_inst->ref = glossy_frame.rtc_initiation_timestamp;
-			rtc_inst->local = local_rtc_ts - (glossy_frame.hop_count * (uint64_t) (mtm_glossy_conf.transmission_delay_us + 152) * CONFIG_SYS_CLOCK_TICKS_PER_SEC) / 1000000 ;
 			dwt_inst->ref = glossy_frame.dwt_initiation_timestamp;
-			dwt_inst->local = local_dwt_ts - glossy_frame.hop_count * (uint64_t) UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us);
+
+			rtc_inst->local = local_rtc_ts - (((glossy_frame.hop_count * (uint64_t) mtm_glossy_conf.transmission_delay_us + 152) * CONFIG_SYS_CLOCK_TICKS_PER_SEC) / 1000000);
+                        /* Attention: here we subtract one from the hop_count since we align the RMARKERS, not the point
+			 * where the reception/transmission commands are issued */
+			dwt_inst->local = local_dwt_ts - (glossy_frame.hop_count-1) * (uint64_t) UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us);
 			result->dist_to_root = glossy_frame.hop_count;
 
 			dwt_switch_buffers(dev);
@@ -2911,16 +2912,6 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 
 	SW_END(ROUND_INIT);
 
-	SW_START(INITIATION_FRAME);
-	// --- Optional: Round Initiation ---
-	if (conf->dwt_clock_sync_instant != NULL) {
-		round_start_dw_ts = conf->dwt_clock_sync_instant->local + UUS_TO_DWT_TS(conf->round_start_offset_us);
-	} else {
-		// use current transmission timestamp and configuration with guard periods
-		round_start_dw_ts = dwt_system_ts(dev);
-	}
-	SW_END(INITIATION_FRAME);
-
 	SW_START(INIT_ROUND_SETUP);
 	// --- PHY setup for ranging round ---
 	k_sem_take(&ctx->dev_lock, K_FOREVER);
@@ -2930,8 +2921,18 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 	dwt_setup_preamble_detection_timeout(dev, ranging_conf->preamble_timeout + conf->guard_period_us/8);
 	k_sem_give(&ctx->dev_lock);
 
+	SW_START(INITIATION_FRAME);
+	// --- Optional: Round Initiation ---
+	if (conf->dwt_clock_sync_instant != NULL) {
+		round_start_dw_ts = conf->dwt_clock_sync_instant->local + UUS_TO_DWT_TS(conf->round_start_offset_us);
+	} else {
+		// use current transmission timestamp and configuration with guard periods
+		round_start_dw_ts = dwt_system_ts(dev) + slot_duration;
+	}
+	SW_END(INITIATION_FRAME);
+
 	// --- lock execute ranging round ---
-	slot_start_ts = (round_start_dw_ts + slot_duration) & DWT_TS_MASK;
+	slot_start_ts = round_start_dw_ts & DWT_TS_MASK;
 
 	// create compiler warning to remember that we have to optimize this here
 #warning "we can probably start right away with a small delay, since we are not really doing anything in the refactored version"
@@ -2945,17 +2946,17 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 	outgoing_frame->rx_ts_count = 0;
 	frame_counter++;
 
-
 	uint8_t have_frame = 0;
 	uint16_t pkt_len;
 	int cfo;
 	// -- do one more iteration because of double buffered operation --
 	SW_END(INIT_ROUND_SETUP);
 	for(size_t s = 0; s < schedule->slot_count + 1; s++) {
-		struct dense_slot *curr_slot = &schedule->slots[s];
+		struct dense_slot *curr_slot = NULL;
 		enum slot_type type;
 
 		if(s < schedule->slot_count) {
+			curr_slot = &schedule->slots[s];
 			type = curr_slot->type;
 		} else {
 			type = DENSE_IDLE_SLOT;
@@ -3096,9 +3097,7 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 			for(size_t i = s+1; i < schedule->slot_count; i++) {
 				struct dense_slot *next_slot = &schedule->slots[i];
 				// later in case we want to have differently sized slots, we can further distinguish here
-				if(next_slot->type == DENSE_TX_SLOT || next_slot->type == DENSE_RX_SLOT || next_slot->type == DENSE_LOAD_TX_BUFFER) {
-					current_frame_transmission_ts += slot_duration;
-				}
+				current_frame_transmission_ts += slot_duration;
 
 				if(next_slot->type == DENSE_TX_SLOT) {
 					future_tx_slot = i;
@@ -3137,7 +3136,7 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 				k_sem_give(&ctx->dev_lock);
 
 				// -- already grab a frame for the next upcoming transmission --
-				outgoing_frame      = &ranging_frames[frame_counter];
+				outgoing_frame = &ranging_frames[frame_counter];
 				outgoing_frame->rx_ts_count = 0;
 				frame_counter++;
 
