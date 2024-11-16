@@ -37,7 +37,7 @@ uint64_t dwt_calculate_actual_tx_ts(uint32_t planned_short_ts, uint16_t tx_anten
 void     dwt_set_frame_filter(const struct device *dev, bool ff_enable, uint8_t ff_type);
 uint8_t *dwt_get_mac(const struct device *dev);
 int dwt_calculate_slot_duration(const struct device *dev, int device_count, int guard_us);
-
+int dwt_set_channel(const struct device *dev, uint16_t channel);
 
 /** Ranging Utility Functions **/
 struct mtm_ranging_timing {
@@ -167,7 +167,7 @@ enum dwt_mtm_ranging_slot {
 
 int      dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *conf, struct dwt_ranging_frame_info **buffers, int *frame_count);
 int      dwt_mtm_ranging_estimate_duration(const struct device *dev, const struct mtm_ranging_config *conf);
-int      dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t node_id, uint16_t timeout_us, struct dwt_glossy_tx_result *result);
+int      dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t node_id, uint16_t guard_period_us, uint16_t timeout_us, struct dwt_glossy_tx_result *result);
 
 void     dwt_set_antenna_delay_rx(const struct device *dev, uint16_t rx_delay_ts);
 void     dwt_set_antenna_delay_tx(const struct device *dev, uint16_t tx_delay_ts);
