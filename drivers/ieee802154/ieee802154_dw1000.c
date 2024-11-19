@@ -1240,6 +1240,37 @@ int dwt_set_channel(const struct device *dev, uint16_t channel)
 	}
 
 	rf_cfg->channel = channel;
+
+	// use appropiate preamble code
+	if (rf_cfg->prf == DWT_PRF_64M) {
+		if(rf_cfg->channel == 4 || rf_cfg->channel == 7) {
+			rf_cfg->rx_shr_code = 18; rf_cfg->tx_shr_code = 18;
+		} else {
+			rf_cfg->rx_shr_code = 10; rf_cfg->tx_shr_code = 10;
+		}
+	} else {
+		switch(rf_cfg->channel) {
+			case 1:
+				rf_cfg->rx_shr_code = 1; rf_cfg->tx_shr_code = 1;
+				break;
+			case 2:
+				rf_cfg->rx_shr_code = 3; rf_cfg->tx_shr_code = 3;
+				break;
+			case 3:
+				rf_cfg->rx_shr_code = 5; rf_cfg->tx_shr_code = 5;
+				break;
+			case 4:
+				rf_cfg->rx_shr_code = 7; rf_cfg->tx_shr_code = 7;
+				break;
+			case 5:
+				rf_cfg->rx_shr_code = 9; rf_cfg->tx_shr_code = 9;
+				break;
+			case 7:
+				rf_cfg->rx_shr_code = 7; rf_cfg->tx_shr_code = 7;
+				break;
+		}
+	}
+
 	LOG_INF("Set channel %u", channel);
 
 	k_sem_take(&ctx->dev_lock, K_FOREVER);
@@ -2163,7 +2194,10 @@ static int dwt_configure_rf_phy(const struct device *dev)
 	}
 
 	/* Set IEEE 802.15.4 compliant mode */
-	sys_cfg &= ~DWT_SYS_CFG_PHR_MODE_11;
+	/* sys_cfg &= ~DWT_SYS_CFG_PHR_MODE_11; */
+
+	/* use non-compliant mode */
+	sys_cfg |= DWT_SYS_CFG_PHR_MODE_11;
 
 	if (rf_cfg->dr == DWT_BR_110K) {
 		/* Set Receiver Mode 110 kbps data rate */
@@ -2653,8 +2687,8 @@ struct mtm_ranging_timing mtm_ranging_conf = {
 struct __attribute__((__packed__)) dwt_glossy_frame_buffer {
 	/* uint8_t msg_id : 4;     // 4 bits for msg_id */
 	/* uint8_t hop_count : 4;  // 4 bits for hop_count */
-	uint8_t msg_id;     // 4 bits for msg_id
-	uint8_t hop_count;  // 4 bits for hop_count
+	uint8_t msg_id;
+	uint8_t hop_count;
 	uint32_t rtc_initiation_timestamp;
 	dwt_packed_ts_t dwt_initiation_timestamp;
 };
@@ -2687,7 +2721,7 @@ void to_packed_dwt_ts(dwt_packed_ts_t ts, dwt_ts_t value) {
 #define DWT_MTM_MAX_FRAMES 100
 
 int dwt_glossy_tx_timesync(const struct  device *dev,
-	uint8_t initiator, uint8_t node_id, uint16_t guard_period_us, uint16_t timeout_us,
+	uint8_t initiator, uint8_t node_id, uint16_t guard_period_us, uint16_t max_depth,
 	struct dwt_glossy_tx_result *result) {
 	int ret = 0;
 	/* static timing_t dbts_start_tx_delay = 0; static timing_t dbts_end_tx_delay = 0; */
@@ -2700,6 +2734,8 @@ int dwt_glossy_tx_timesync(const struct  device *dev,
 	uint32_t initiator_rtc_ts, local_rtc_ts;
 	dwt_ts_t initiator_dwt_ts, local_dwt_ts;
 	atomic_t old_state;
+
+	uint16_t timeout_us = max_depth * mtm_glossy_conf.transmission_delay_us;
 
 	/* uint64_t psdu_duration_sans_preamble = dwt_get_pkt_duration_ns(ctx, sizeof(dwt_glossy_frame_buffer)) - */
 
@@ -2757,7 +2793,7 @@ int dwt_glossy_tx_timesync(const struct  device *dev,
 	} else {
 		// retry this section to maybe get one of the other hops if one hop fails
 		bool success = false;
-		for(size_t k = 0; !success && k < 2; k++) {
+		for(size_t k = 0; !success && (k < max_depth || !max_depth); k++) {
 			k_sem_take(&ctx->dev_lock, K_FOREVER);
 			dwt_enable_rx(dev, timeout_us + (timeout_us > 0 ? guard_period_us : 0), 0);
 			k_sem_give(&ctx->dev_lock);

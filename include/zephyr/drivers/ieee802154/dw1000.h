@@ -120,6 +120,8 @@ struct __attribute__((__packed__)) dwt_tagged_timestamp {
 	uint8_t ranging_id, slot;
 };
 
+#warning "Don't hard code the maximum payload of a ranging frame"
+#define DWT_MTM_MAX_PAYLOAD 250 // requires non-compliant frame size mode in sys configuration
 #define DWT_RANGING_FRAME_PAYLOAD_OFFSET(FRAME) (FRAME->payload + sizeof(struct dwt_tagged_timestamp) * FRAME->rx_ts_count)
 struct __attribute__((__packed__)) dwt_ranging_frame_buffer {
 	uint8_t  msg_id;      // identifier of which message type during the protocol run we are sending
@@ -127,7 +129,7 @@ struct __attribute__((__packed__)) dwt_ranging_frame_buffer {
 	dwt_packed_ts_t tx_ts;
 	uint8_t  rx_ts_count; // amount of received timestamps
 	uint8_t  payload_size;
-	uint8_t payload[110]; // payload will be located AFTER reception timestamps
+	uint8_t payload[DWT_MTM_MAX_PAYLOAD]; // payload will be located AFTER reception timestamps
 };
 
 enum dwt_ranging_frame_status {
@@ -167,7 +169,7 @@ enum dwt_mtm_ranging_slot {
 
 int      dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *conf, struct dwt_ranging_frame_info **buffers, int *frame_count);
 int      dwt_mtm_ranging_estimate_duration(const struct device *dev, const struct mtm_ranging_config *conf);
-int      dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t node_id, uint16_t guard_period_us, uint16_t timeout_us, struct dwt_glossy_tx_result *result);
+int      dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t node_id, uint16_t guard_period_us, uint16_t max_depth, struct dwt_glossy_tx_result *result);
 
 void     dwt_set_antenna_delay_rx(const struct device *dev, uint16_t rx_delay_ts);
 void     dwt_set_antenna_delay_tx(const struct device *dev, uint16_t tx_delay_ts);
