@@ -3140,7 +3140,7 @@ int dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *c
 			rx_level = 10.0f * log10f(cir_pwr * BIT(17) /
 				(rx_pacc * rx_pacc)) - a_const;
 
-			bias_correction = get_range_bias_by_rssi(rx_level);
+			bias_correction = conf->correct_timestamp_bias ? get_range_bias_by_rssi(rx_level) : 0;
 
 			// --- read incoming frame and check for validity
 			dwt_register_read(dev, DWT_RX_BUFFER_ID, 0, pkt_len, rx_buf);

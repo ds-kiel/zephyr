@@ -69,6 +69,8 @@ struct dense_slot {
 		DENSE_IDLE_SLOT,
 	} type;
 
+	uint16_t duration_us;
+
 	union {
 		// Meta information for LOAD_TX_BUFFER
 		struct {
@@ -100,7 +102,7 @@ struct mtm_ranging_config {
 	uint64_t micro_slot_offset_ns;
 
 	// options
-	uint8_t cca, reject_frames, cfo;
+	uint8_t cca, reject_frames, cfo, correct_timestamp_bias;
 
 	cir_memory_callback_t cir_handler;
 
