@@ -1,0 +1,5 @@
+board:
+  name: uwbdeck
+  vendor: DS-CAU
+  socs:
+    - name: nrf52840

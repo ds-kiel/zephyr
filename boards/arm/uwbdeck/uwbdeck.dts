@@ -1,0 +1,192 @@
+/dts-v1/;
+#include <nordic/nrf52840_qfaa.dtsi>
+#include "uwbdeck-pinctrl.dtsi"
+
+/ {
+  model = "Custom UWB deck for Crazyflie 2.X, Rev. 1";
+  compatible = "DS-CAU,uwbdeck";
+
+  aliases {
+    led0 = &led0;
+    switch0 = &switch0;
+    bt-hci = &radio;
+  };
+
+  chosen {
+    zephyr,sram = &sram0;
+    zephyr,flash = &flash0;
+    zephyr,code-partition = &slot0_partition;
+
+    zephyr,uart-mcumgr    = &uart0;
+    zephyr,bt-mon-uart    = &uart0;
+    zephyr,bt-c2h-uart    = &uart0;
+    zephyr,ieee802154     = &ieee802154_uwb;
+  };
+
+  // `ready_irq` is the interrupt line that is triggered by the nRF
+  // when new data is available. Exposed to the header.
+  //
+  // ready_irq: ready_irq {
+  //   compatible = "ready-irq";
+  //   gpios = <&gpio0 ??? GPIO_ACTIVE_HIGH>;  /* TODO */
+  // };
+
+  leds {
+    compatible = "gpio-leds";
+    led0: led0 {
+      gpios = <&gpio0 24 GPIO_ACTIVE_HIGH>;
+      label = "Blue LED";
+    };
+  };
+
+  switches {
+    compatible = "gpio-keys";
+    switch0: switch0 {
+      gpios = <&gpio0 29 GPIO_ACTIVE_LOW>;
+      label = "User Switch";
+    };
+  };
+};
+
+&spi1 {
+  status = "okay";
+  cs-gpios = <&gpio0 22 GPIO_ACTIVE_LOW>;
+  pinctrl-0 = <&spi1_default>;
+  pinctrl-1 = <&spi1_sleep>;
+  pinctrl-names = "default", "sleep";
+
+  crazyflie: crazyflie@0 {
+    compatible = "vnd,spi-device";
+    reg = <0>;
+    spi-max-frequency = <1600000>;
+    label = "crazyflie";
+  };
+};
+
+
+&uart0 {
+	status = "okay";
+	compatible = "nordic,nrf-uarte";
+	current-speed = <115200>;
+	pinctrl-0 = <&uart0_default>;
+	pinctrl-1 = <&uart0_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&uicr {
+	gpio-as-nreset;
+};
+
+&spi2 {
+  compatible = "nordic,nrf-spi";
+ 	//status = "okay";
+  status = "disabled";
+  cs-gpios = <&gpio0 23 GPIO_ACTIVE_LOW>;
+
+  pinctrl-0 = <&spi2_default>;
+  pinctrl-1 = <&spi2_sleep>;
+  pinctrl-names = "default", "sleep";
+
+  ieee802154_uwb: dw1000@0 {
+    status = "okay";
+		compatible = "decawave,dw1000";
+		spi-max-frequency = <8000000>;
+                reg = <0>;
+		int-gpios = <&gpio0 3 GPIO_ACTIVE_HIGH>;	  /* P0.03 */
+		reset-gpios = <&gpio1 15 GPIO_ACTIVE_LOW>;	/* P1.15 */
+  };
+};
+
+&pinctrl {
+  spi1_default: spi1_default {
+    group1 {
+      psels = <NRF_PSEL(SPIM_SCK,  0, 7)>,
+              <NRF_PSEL(SPIM_MOSI, 0, 4)>,
+              <NRF_PSEL(SPIM_MISO, 0, 5)>;
+    };
+  };
+  spi1_sleep: spi1_sleep {
+    group1 {
+      psels = <NRF_PSEL(SPIM_SCK,  0, 7)>,
+              <NRF_PSEL(SPIM_MOSI, 0, 4)>,
+              <NRF_PSEL(SPIM_MISO, 0, 5)>;
+      low-power-enable;
+    };
+  };
+  spi2_default: spi2_default {
+    group1 {
+      psels = <NRF_PSEL(SPIM_SCK,  0, 14)>,
+              <NRF_PSEL(SPIM_MOSI, 0, 13)>,
+              <NRF_PSEL(SPIM_MISO, 0, 17)>;
+    };
+  };
+  spi2_sleep: spi2_sleep {
+    group1 {
+      psels = <NRF_PSEL(SPIM_SCK,  0, 14)>,
+              <NRF_PSEL(SPIM_MOSI, 0, 13)>,
+              <NRF_PSEL(SPIM_MISO, 0, 17)>;
+      low-power-enable;
+    };
+  };
+  uart0_default: uart0_default {
+    group1 {
+      psels = <NRF_PSEL(UART_TX, 0, 5)>,
+              <NRF_PSEL(UART_RX, 0, 11)>;
+    };
+  };
+  uart0_sleep: uart0_sleep {
+    group1 {
+      psels = <NRF_PSEL(UART_TX, 0, 5)>,
+              <NRF_PSEL(UART_RX, 0, 11)>;
+	low-power-enable;
+   };
+  };
+};
+
+&qspi {
+  status = "disabled";
+};
+
+&gpio0 {
+  status = "okay";
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+&gpiote {
+  status = "okay";
+};
+
+&radio {
+  status = "okay";
+};
+
+&flash0 {
+  partitions {
+    compatible = "fixed-partitions";
+    #address-cells = <1>;
+    #size-cells = <1>;
+
+    boot_partition: partition@0 {
+      label = "mcuboot";
+      reg = <0x00000000 DT_SIZE_K(48)>;
+    };
+
+    slot0_partition: partition@c000 {
+      label = "image-0";
+      reg = <0x0000c000 DT_SIZE_K(472)>;
+    };
+
+    slot1_partition: partition@82000 {
+      label = "image-1";
+      reg = <0x00082000 DT_SIZE_K(472)>;
+    };
+
+    storage_partition: partition@f8000 {
+      label = "storage";
+      reg = <0x000f8000 DT_SIZE_K(32)>;
+    };
+  };
+};

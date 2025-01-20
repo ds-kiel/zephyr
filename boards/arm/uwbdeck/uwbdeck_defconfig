@@ -1,0 +1,29 @@
+CONFIG_SOC_SERIES_NRF52X=y
+CONFIG_SOC_NRF52840_QFAA=y
+CONFIG_BOARD_UWBDECK=y
+
+
+CONFIG_ARM_MPU=y
+CONFIG_HW_STACK_PROTECTION=y
+
+CONFIG_GPIO=y
+CONFIG_SPI=y
+CONFIG_SERIAL=y
+
+# Because the UWB Deck (Rev 1) has no external 32kHz crystal,
+# and because the RTOS waits for the 32kHz crystal to stabilize
+# before starting the RTC, we need to use the internal RC oscillator
+# as the 32kHz clock source. Otherwise, the RTOS will hang on boot.
+CONFIG_CLOCK_CONTROL_NRF_K32SRC_RC=y
+CONFIG_CLOCK_CONTROL_NRF_K32SRC_RC_CALIBRATION=y
+CONFIG_CLOCK_CONTROL_NRF_K32SRC_500PPM=y
+
+# enable RTT logging
+CONFIG_LOG=y
+CONFIG_USE_SEGGER_RTT=y
+CONFIG_LOG_BACKEND_RTT=y
+CONFIG_LOG_DEFAULT_LEVEL=3
+
+CONFIG_CONSOLE=y
+CONFIG_UART_CONSOLE=y
+CONFIG_RTT_CONSOLE=y

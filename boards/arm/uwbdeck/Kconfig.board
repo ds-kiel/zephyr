@@ -1,0 +1,8 @@
+# DS-Kiel Uwbdeck board configuration
+
+# Copyright (c) 2024 Lasse Züngel, Christian Richter
+# SPDX-License-Identifier: Apache-2.0
+
+config BOARD_UWBDECK
+	bool "DS-Kiel Uwbdeck"
+	depends on SOC_NRF52840_QFAA
