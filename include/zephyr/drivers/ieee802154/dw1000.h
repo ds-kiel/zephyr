@@ -11,35 +11,20 @@
 #include <zephyr/device.h>
 #include <zephyr/sys/timeutil.h>
 
+#warning "Don't hard code the maximum payload of a ranging frame"
+#define DWT_MTM_MAX_PAYLOAD 250 // requires non-compliant frame size mode in sys configuration
+#define DWT_RANGING_FRAME_PAYLOAD_OFFSET(FRAME) (FRAME->payload + sizeof(struct deca_tagged_timestamp) * FRAME->rx_ts_count)
 
-/**
- * Set the upper 32 bits of the dwt timestamp
- * This method should be called just before the invocation of the tx method and from within the same
- * thread
- */
-void dwt_set_delayed_tx_short_ts(const struct device *dev, uint32_t short_ts);
+typedef uint16_t deca_short_addr_t;
+typedef uint8_t dwt_packed_ts_t[5];
+typedef uint64_t dwt_ts_t;
+typedef int (*cir_memory_callback_t)(int slot, const uint8_t *cir_memory, size_t size);
 
-/**
- * Sets the delayed tx and returns the estimated tx ts
- * @param dev The dw1000 device
- * @param uus_delay the delay in uwb microseconds
- * @return estimated tx ts (corrected by antenna delay)
- */
-uint64_t dwt_plan_delayed_tx(const struct device *dev, uint64_t uus_delay);
-uint64_t dwt_rx_ts(const struct device *dev);
-uint64_t dwt_system_ts(const struct device *dev);
-uint32_t dwt_system_short_ts(const struct device *dev);
-uint64_t dwt_ts_to_fs(uint64_t ts);
-uint64_t dwt_fs_to_ts(uint64_t fs);
-uint64_t dwt_short_ts_to_fs(uint32_t ts);
-uint32_t dwt_fs_to_short_ts(uint64_t fs);
-uint64_t dwt_calculate_actual_tx_ts(uint32_t planned_short_ts, uint16_t tx_antenna_delay);
-void     dwt_set_frame_filter(const struct device *dev, bool ff_enable, uint8_t ff_type);
-uint8_t *dwt_get_mac(const struct device *dev);
-int dwt_calculate_slot_duration(const struct device *dev, int device_count, int guard_us);
-int dwt_set_channel(const struct device *dev, uint16_t channel);
+struct mtm_round_timing {
+	uint32_t round_init_us, initiation_frame_us, init_round_setup_us,
+		prepare_tx_us, prog_rx_ts_us, frame_handling_us, irq_handling_us;
+};
 
-/** Ranging Utility Functions **/
 struct mtm_ranging_timing {
 	uint64_t min_slot_length_us,
 		phy_activate_rx_delay,
@@ -48,20 +33,7 @@ struct mtm_ranging_timing {
 	uint16_t frame_timeout_period, preamble_timeout;
 };
 
-
-/* This is platform specific and should be measured through ANALYZE_DWT_TIMING
-   directly in the driver implementation. You should start with a pessimistic slot duration and
-   afterward reduce the length depending on the measurement result.*/
-struct mtm_round_timing {
-	uint32_t round_init_us, initiation_frame_us, init_round_setup_us,
-		prepare_tx_us, prog_rx_ts_us, frame_handling_us, irq_handling_us;
-};
-
-typedef int (*cir_memory_callback_t)(int slot, const uint8_t *cir_memory, size_t size);
-
-
-// Preactively wrap into structure in case more meta information will be included in the future.
-struct dense_slot {
+struct deca_slot {
 	enum slot_type {
 		DENSE_LOAD_TX_BUFFER,
 		DENSE_RX_SLOT,
@@ -76,6 +48,8 @@ struct dense_slot {
 		struct {
 			uint8_t *payload;
 			size_t payload_size;
+
+			bool load_stored_timestamps;
 		};
 
 		// Meta information for rx
@@ -86,16 +60,16 @@ struct dense_slot {
 	} meta;
 };
 
-struct mtm_ranging_dense_slot_schedule {
+struct deca_schedule {
 	uint16_t slot_count;
-	struct dense_slot *slots;
+	struct deca_slot *slots;
 };
 
-struct mtm_ranging_config {
-	uint8_t ranging_id;
+struct deca_ranging_configuration {
+	deca_short_addr_t addr;
 
-	struct mtm_ranging_dense_slot_schedule *schedule;
-	struct timeutil_sync_instant *dwt_clock_sync_instant;
+	struct deca_schedule *schedule;
+	struct timeutil_sync_instant *deca_clock_synchronization_instance;
 	uint16_t round_start_offset_us; // only relevant if time sync instant is used
 
 	uint32_t slot_duration_us, guard_period_us;
@@ -111,42 +85,32 @@ struct mtm_ranging_config {
 	uint16_t cca_duration;
 };
 
-typedef uint8_t dwt_packed_ts_t[5];
-typedef uint64_t dwt_ts_t;
-
-dwt_ts_t from_packed_dwt_ts(const dwt_packed_ts_t ts);
-void to_packed_dwt_ts(dwt_packed_ts_t ts, dwt_ts_t value);
-
-struct __attribute__((__packed__)) dwt_tagged_timestamp {
+struct __attribute__((__packed__)) deca_tagged_timestamp {
 	dwt_packed_ts_t ts;
-	uint8_t ranging_id, slot;
+	deca_short_addr_t addr, slot;
 };
 
-#warning "Don't hard code the maximum payload of a ranging frame"
-#define DWT_MTM_MAX_PAYLOAD 250 // requires non-compliant frame size mode in sys configuration
-#define DWT_RANGING_FRAME_PAYLOAD_OFFSET(FRAME) (FRAME->payload + sizeof(struct dwt_tagged_timestamp) * FRAME->rx_ts_count)
-struct __attribute__((__packed__)) dwt_ranging_frame_buffer {
+struct __attribute__((__packed__)) deca_ranging_frame  {
 	uint8_t  msg_id;      // identifier of which message type during the protocol run we are sending
-	uint8_t  ranging_id;  // unique identifier of this node for ranging
+	deca_short_addr_t  addr;  // unique identifier of this node for ranging
 	dwt_packed_ts_t tx_ts;
 	uint8_t  rx_ts_count; // amount of received timestamps
 	uint8_t  payload_size;
 	uint8_t payload[DWT_MTM_MAX_PAYLOAD]; // payload will be located AFTER reception timestamps
 };
 
-enum dwt_ranging_frame_status {
-	DWT_MTM_FRAME_OKAY,
-	DWT_MTM_FRAME_REJECTED
-};
+struct deca_ranging_frame_container {
+	struct deca_ranging_frame *frame;
 
-struct dwt_ranging_frame_info {
-	struct dwt_ranging_frame_buffer *frame;
-	enum dwt_ranging_frame_status status;
-
-	enum dwt_ranging_frame_info_type {
-		DWT_RANGING_TRANSMITTED_FRAME = 0,
-		DWT_RANGING_RECEIVED_FRAME = 1,
+	enum deca_frame_type {
+		DECA_TRANSMITTED = 0,
+		DECA_RECEIVED = 1,
 	} type;
+
+	enum deca_ranging_frame_status {
+		DECA_FRAME_OKAY,
+		DECA_FRAME_REJECTED
+	} status;
 
 	uint32_t rx_pacc;
 	uint32_t cir_pwr;
@@ -158,27 +122,43 @@ struct dwt_ranging_frame_info {
 	dwt_ts_t timestamp;
 };
 
-struct dwt_glossy_tx_result {
+struct deca_ranging_digest {
+	struct deca_ranging_frame_container *frames;
+	size_t length;
+};
+
+struct deca_glossy_result {
 	struct timeutil_sync_instant rtc_clock_sync_instant;
-	struct timeutil_sync_instant dwt_clock_sync_instant;
+	struct timeutil_sync_instant deca_clock_synchronization_instance;
 	uint8_t dist_to_root; // aka hop counter
 };
 
-enum dwt_mtm_ranging_slot {
-	DWT_TX_AUTO = 0xFE, // TODO implement, this indicates that a transmission is wanted, but no transmission slot is specified
-	DWT_NO_TX_SLOT = 0xFF, // indicates that a node should not transmit during this round
-};
+void dwt_set_delayed_tx_short_ts(const struct device *dev, uint32_t short_ts);
+uint64_t dwt_plan_delayed_tx(const struct device *dev, uint64_t uus_delay);
+uint64_t dwt_rx_ts(const struct device *dev);
+uint64_t dwt_system_ts(const struct device *dev);
+uint32_t dwt_system_short_ts(const struct device *dev);
+uint64_t dwt_ts_to_fs(uint64_t ts);
+uint64_t dwt_fs_to_ts(uint64_t fs);
+uint64_t dwt_short_ts_to_fs(uint32_t ts);
+uint32_t dwt_fs_to_short_ts(uint64_t fs);
+uint64_t dwt_calculate_actual_tx_ts(uint32_t planned_short_ts, uint16_t tx_antenna_delay);
+void     dwt_set_frame_filter(const struct device *dev, bool ff_enable, uint8_t ff_type);
+uint8_t *dwt_get_mac(const struct device *dev);
+int dwt_calculate_slot_duration(const struct device *dev, int device_count, int guard_us);
+int dwt_set_channel(const struct device *dev, uint16_t channel);
 
-int      dwt_mtm_ranging(const struct device *dev, const struct mtm_ranging_config *conf, struct dwt_ranging_frame_info **buffers, int *frame_count);
-int      dwt_mtm_ranging_estimate_duration(const struct device *dev, const struct mtm_ranging_config *conf);
-int      dwt_glossy_tx_timesync(const struct  device *dev, uint8_t initiator, uint8_t node_id, uint16_t guard_period_us, uint16_t max_depth, struct dwt_glossy_tx_result *result);
+dwt_ts_t from_packed_dwt_ts(const dwt_packed_ts_t ts);
+void to_packed_dwt_ts(dwt_packed_ts_t ts, dwt_ts_t value);
 
+int      deca_ranging(const struct device *dev, const struct deca_ranging_configuration *conf, struct deca_ranging_digest *digest);
+int      dwt_mtm_ranging_estimate_duration(const struct device *dev, const struct deca_ranging_configuration *conf);
+int      deca_glossy_time_synchronization(const struct  device *dev, uint8_t initiator, deca_short_addr_t node_id, uint16_t guard_period_us, uint16_t max_depth, struct deca_glossy_result *result);
 void     dwt_set_antenna_delay_rx(const struct device *dev, uint16_t rx_delay_ts);
 void     dwt_set_antenna_delay_tx(const struct device *dev, uint16_t tx_delay_ts);
 uint16_t dwt_antenna_delay_rx(const struct device *dev);
 uint16_t dwt_antenna_delay_tx(const struct device *dev);
 uint32_t dwt_otp_antenna_delay(const struct device *dev);
-
 uint8_t  dwt_rx_ttcko_rc_phase(const struct device *dev);
 int      dwt_readcarrierintegrator(const struct device *dev);
 float    dwt_rx_clock_ratio_offset(const struct device *dev);
