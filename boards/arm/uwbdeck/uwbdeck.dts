@@ -32,6 +32,7 @@
     gpios = <&gpio0 30 GPIO_ACTIVE_HIGH>; /* P0.30 */
   };
 
+
   // TODO: Reset between Header <-> nRF <-> DW1000 ?
 
   leds {
@@ -103,11 +104,11 @@
 
   ieee802154_uwb: dw1000@0 {
     status = "okay";
-		compatible = "decawave,dw1000";
-		spi-max-frequency = <8000000>;
-                reg = <0>;
-		int-gpios = <&gpio0 29 GPIO_ACTIVE_HIGH>; /* P0.29 */
-		reset-gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;	/* P0.02 */
+    compatible = "decawave,dw1000";
+    spi-max-frequency = <8000000>;
+    reg = <0>;
+    int-gpios = <&gpio0 29 GPIO_ACTIVE_HIGH>; /* P0.29 */
+    reset-gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;	/* P0.02 */
   };
 };
 

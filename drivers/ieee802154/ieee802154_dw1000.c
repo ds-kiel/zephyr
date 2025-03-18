@@ -72,7 +72,6 @@ static bool spi_initialized;
 #include <zephyr/drivers/ieee802154/dw1000.h>
 
 #define ANALYZE_DWT_TIMING 0
-#define USE_GPIO_DEBUG 1
 
 #if ANALYZE_DWT_TIMING
 struct timing_log {
@@ -115,37 +114,6 @@ SW_DEFINE(PROG_RX_TX);
 SW_DEFINE(FRAME_HANDLING);
 SW_DEFINE(IRQ_WAIT_DELAY);
 SW_DEFINE(IRQ_HANDLING);
-
-
-#if USE_GPIO_DEBUG
-
-#define DEB0_NODE DT_ALIAS(deb0)
-#define DEB1_NODE DT_ALIAS(deb1)
-
-
-static const struct gpio_dt_spec deb0 = GPIO_DT_SPEC_GET(DEB0_NODE, gpios);;
-static const struct gpio_dt_spec deb1 = GPIO_DT_SPEC_GET(DEB1_NODE, gpios);;
-
-static void setup_debug_gpios() {
-	gpio_pin_configure_dt(&deb0, GPIO_OUTPUT | GPIO_OUTPUT_ACTIVE);
-	gpio_pin_configure_dt(&deb1, GPIO_OUTPUT | GPIO_OUTPUT_ACTIVE);
-}
-
-#define TOGGLE_DEBUG_GPIO(GPIO) do { \
-    gpio_pin_toggle_dt(&deb##GPIO); \
-} while(0)
-
-#define SET_GPIO_HIGH(GPIO) do { \
-		gpio_pin_set_dt(&deb##GPIO, 1);	\
-} while(0)
-
-#define SET_GPIO_LOW(GPIO) do { \
-		gpio_pin_set_dt(&deb##GPIO, 0);	\
-} while(0)
-#else
-#define TOGGLE_DEBUG_GPIO(GPIO)
-#define TOGGLE_DEBUG_GPIOS()
-#endif
 
 #define DT_DRV_COMPAT decawave_dw1000
 
@@ -2481,12 +2449,6 @@ static int dw1000_init(const struct device *dev)
 	LOG_INF("Initialize DW1000 Transceiver");
 	k_sem_init(&ctx->phy_sem, 0, 1);
 
-#if USE_GPIO_DEBUG
-	setup_debug_gpios();
-#endif
-
-
-
 	/* slow SPI config */
 #if ZEPHYR_SPI
 	memcpy(&ctx->spi_cfg_slow, &hi_cfg->bus.config, sizeof(ctx->spi_cfg_slow));
@@ -3285,7 +3247,7 @@ int deca_ranging(const struct device *dev,
 			if(irq_state == DWT_IRQ_FRAME_WAIT_TIMEOUT) {
 				ret = -ETIMEDOUT;
 				goto cleanup;
-			} else if( irq_state == DWT_IRQ_PREAMBLE_DETECT_TIMEOUT ) {
+			} else if( irq_state == DWT_IRQ_PREAMBLE_DETECT_TIMEOUT) {
 			} else if(irq_state == DWT_IRQ_RX) {
 				have_frame = 1;
 
