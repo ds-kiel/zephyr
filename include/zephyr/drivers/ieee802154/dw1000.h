@@ -70,7 +70,7 @@ struct deca_ranging_configuration {
 
 	struct deca_schedule *schedule;
 	struct timeutil_sync_instant *deca_clock_synchronization_instance;
-	uint16_t round_start_offset_us; // only relevant if time sync instant is used
+	uint64_t round_start_offset_us; // only relevant if time sync instant is used
 
 	uint32_t slot_duration_us, guard_period_us;
 	uint64_t micro_slot_offset_ns;

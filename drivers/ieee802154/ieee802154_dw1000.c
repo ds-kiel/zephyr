@@ -1239,7 +1239,7 @@ int dwt_set_channel(const struct device *dev, uint16_t channel)
 		}
 	}
 
-	LOG_INF("Set channel %u", channel);
+	/* LOG_INF("Set channel %u", channel); */
 
 	k_sem_take(&ctx->dev_lock, K_FOREVER);
 
@@ -2953,7 +2953,7 @@ int deca_ranging(const struct device *dev,
 	static struct deca_ranging_frame frames[DWT_MTM_MAX_FRAMES];
 	static struct deca_ranging_frame_container frame_container[DWT_MTM_MAX_FRAMES];
 
-	int ret = 0, irq_state, frame_counter = 0, frame_container_count = 0;
+	int ret = 0, irq_state, frame_counter = 0, frame_container_counter = 0;
 	struct dwt_context *ctx = dev->data;
 	struct mtm_ranging_timing *ranging_conf = &mtm_ranging_conf;
 	struct deca_schedule *schedule = conf->schedule;
@@ -3115,8 +3115,8 @@ int deca_ranging(const struct device *dev,
 				LOG_ERR("invalid ranging frame");
 			} else {
 				dwt_ts_t reception_ts = dwt_rx_timestamp_from_rx_info(&rx_info);
-				struct deca_ranging_frame_container   *incoming_frame_info = &frame_container[frame_container_count];
-				frame_container_count++;
+				struct deca_ranging_frame_container   *incoming_frame_info = &frame_container[frame_container_counter];
+				frame_container_counter++;
 
 				// store frame into frame_container
 				incoming_frame_info->frame = incoming_frame;
@@ -3204,8 +3204,8 @@ int deca_ranging(const struct device *dev,
 				to_packed_dwt_ts(outgoing_frame->tx_ts, current_frame_transmission_ts);
 
 				// -- store buffer into frame info struct --
-				struct deca_ranging_frame_container   *outgoing_frame_info = &frame_container[frame_container_count];
-				frame_container_count++;
+				struct deca_ranging_frame_container   *outgoing_frame_info = &frame_container[frame_container_counter];
+				frame_container_counter++;
 
 				outgoing_frame_info->frame = outgoing_frame;
 				outgoing_frame_info->timestamp = current_frame_transmission_ts;
@@ -3304,7 +3304,7 @@ int deca_ranging(const struct device *dev,
 	}
 
 	digest->frames = frame_container;
-	digest->length = frame_container_count;
+	digest->length = frame_container_counter;
 
   cleanup:
 	// --- clear bits ----
