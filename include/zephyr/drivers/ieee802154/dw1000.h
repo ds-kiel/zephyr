@@ -85,6 +85,16 @@ struct deca_ranging_configuration {
 	uint16_t cca_duration;
 };
 
+struct deca_glossy_configuration {
+	deca_short_addr_t node_addr;
+	bool isRoot;
+	uint16_t guard_period_us;
+	uint16_t max_depth;
+	uint8_t *payload;
+	size_t payload_size;
+	uint16_t transmission_delay_us;
+};
+
 struct __attribute__((__packed__)) deca_tagged_timestamp {
 	dwt_packed_ts_t ts;
 	deca_short_addr_t addr, slot;
@@ -131,6 +141,8 @@ struct deca_glossy_result {
 	struct timeutil_sync_instant rtc_clock_sync_instant;
 	struct timeutil_sync_instant deca_clock_synchronization_instance;
 	uint8_t dist_to_root; // aka hop counter
+	size_t payload_size;
+	uint8_t *payload;
 };
 
 void dwt_set_delayed_tx_short_ts(const struct device *dev, uint32_t short_ts);
@@ -152,8 +164,9 @@ dwt_ts_t from_packed_dwt_ts(const dwt_packed_ts_t ts);
 void to_packed_dwt_ts(dwt_packed_ts_t ts, dwt_ts_t value);
 
 int      deca_ranging(const struct device *dev, const struct deca_ranging_configuration *conf, struct deca_ranging_digest *digest);
+int      deca_glossy_time_synchronization(const struct  device *dev, struct deca_glossy_configuration *conf, struct deca_glossy_result *result);
+
 int      dwt_mtm_ranging_estimate_duration(const struct device *dev, const struct deca_ranging_configuration *conf);
-int      deca_glossy_time_synchronization(const struct  device *dev, uint8_t initiator, deca_short_addr_t node_id, uint16_t guard_period_us, uint16_t max_depth, struct deca_glossy_result *result);
 void     dwt_set_antenna_delay_rx(const struct device *dev, uint16_t rx_delay_ts);
 void     dwt_set_antenna_delay_tx(const struct device *dev, uint16_t tx_delay_ts);
 uint16_t dwt_antenna_delay_rx(const struct device *dev);

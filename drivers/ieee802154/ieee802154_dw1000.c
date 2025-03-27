@@ -2638,14 +2638,7 @@ struct mtm_ranging_timing mtm_ranging_conf = {
 
 #warning "we don't receive the full 128 pacc symbols, is our timing completely correct here? Maybe check phy_activate_rx_delay again"
 
-#warning "Implement Glossy payload"
-/* struct __attribute__((__packed__)) dwt_glossy_frame_buffer { */
-/* 	uint8_t  msg_id;     // some identifier that this is a MTM ranging protocol execution */
-/* 	uint8_t hop_count; */
-/* 	int32_t rtc_initiation_timestamp; */
-/* 	dwt_packed_ts_t dwt_initiation_timestamp; */
-/* }; */
-
+#define MAX_GLOSSY_PAYLOAD 50
 struct __attribute__((__packed__)) dwt_glossy_frame_buffer {
 	/* uint8_t msg_id : 4;     // 4 bits for msg_id */
 	/* uint8_t hop_count : 4;  // 4 bits for hop_count */
@@ -2653,17 +2646,11 @@ struct __attribute__((__packed__)) dwt_glossy_frame_buffer {
 	uint8_t hop_count;
 	uint32_t rtc_initiation_timestamp;
 	dwt_packed_ts_t dwt_initiation_timestamp;
+	uint8_t payload_size;
+	uint8_t payload[MAX_GLOSSY_PAYLOAD]; // payload will be located AFTER reception timestamps
 };
 
-
-#warning "This should be much smaller, why does is currently need to be so big? Probably because bad rtc sync"
-struct mtm_glossy_setup_struct {
-	uint64_t transmission_delay_us;
-} mtm_glossy_conf = {
-	/* .transmission_delay_us = 2000, */
-	.transmission_delay_us = 750,
-};
-
+static uint8_t received_glossy_payload[MAX_GLOSSY_PAYLOAD];
 
 dwt_ts_t from_packed_dwt_ts(const dwt_packed_ts_t ts) {
 	return (dwt_ts_t) ts[0] | ((dwt_ts_t) ts[1] << 8) | ((dwt_ts_t) ts[2] << 16) | ((dwt_ts_t) ts[3] << 24) | ((dwt_ts_t) ts[4] << 32);
@@ -2682,12 +2669,9 @@ void to_packed_dwt_ts(dwt_packed_ts_t ts, dwt_ts_t value) {
 #define DWT_MTM_GLOSSY_TX_ID 0x03
 #define DWT_MTM_MAX_FRAMES 80
 
-int deca_glossy_time_synchronization(const struct  device *dev,
-	uint8_t initiator, deca_short_addr_t node_id, uint16_t guard_period_us, uint16_t max_depth,
-	struct deca_glossy_result *result) {
+int deca_glossy_time_synchronization(const struct device *dev,
+	struct deca_glossy_configuration *conf, struct deca_glossy_result *result) {
 	int ret = 0;
-	/* static timing_t dbts_start_tx_delay = 0; static timing_t dbts_end_tx_delay = 0; */
-	/* static timing_t dbts_start_rx_delay = 0; static timing_t dbts_end_rx_delay = 0; */
  	struct dwt_context *ctx = dev->data;
 	struct timeutil_sync_instant *rtc_inst = &result->rtc_clock_sync_instant;
 	struct timeutil_sync_instant *dwt_inst = &result->deca_clock_synchronization_instance;
@@ -2697,9 +2681,7 @@ int deca_glossy_time_synchronization(const struct  device *dev,
 	dwt_ts_t initiator_dwt_ts, local_dwt_ts;
 	atomic_t old_state;
 
-	uint16_t timeout_us = max_depth * mtm_glossy_conf.transmission_delay_us;
-
-	/* uint64_t psdu_duration_sans_preamble = dwt_get_pkt_duration_ns(ctx, sizeof(dwt_glossy_frame_buffer)) - */
+	uint16_t timeout_us = conf->max_depth * conf->transmission_delay_us;
 
 	// --- Prevent execution of multiple ranging tasks
 	if (atomic_test_and_set_bit(&ctx->state, DWT_STATE_TX)) {
@@ -2707,7 +2689,14 @@ int deca_glossy_time_synchronization(const struct  device *dev,
 		return -EBUSY;
 	}
 
-	/* LOG_WRN("%d us", (dwt_get_pkt_duration_ns(ctx, sizeof(struct dwt_glossy_frame_buffer)) / 1000) - 128); */ //currently 56us
+	if(conf->payload_size > MAX_GLOSSY_PAYLOAD) {
+		LOG_ERR("Glossy Payload too large, passed %u, max %u", conf->payload_size, MAX_GLOSSY_PAYLOAD);
+		ret = -EINVAL;
+	}
+
+	if(conf->payload_size > 0 && !conf->isRoot) {
+		LOG_WRN("Only the root node may provide a payload, ignoring");
+	}
 
 	old_state = ctx->state;
 
@@ -2722,24 +2711,27 @@ int deca_glossy_time_synchronization(const struct  device *dev,
 	k_sem_give(&ctx->dev_lock);
 
 	// --- Round Initiation ---
-	if (initiator) {
+	if (conf->isRoot) {
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
-		initiator_rtc_ts = k_cycle_get_32();// + ((CONFIG_SYS_CLOCK_TICKS_PER_SEC * mtm_ranging_conf.initial_tx_delay_us) / 1000000);
-		/* dtbs_start_tx_delay = timing_counter_get(); */
-		initiator_dwt_ts = (dwt_system_ts(dev) + UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us + guard_period_us)) % DWT_TS_MASK;
-		/* dtbs_end_tx_delay = timing_counter_get(); */
+		initiator_rtc_ts = k_cycle_get_32();
+		initiator_dwt_ts = (dwt_system_ts(dev) + UUS_TO_DWT_TS(conf->transmission_delay_us + conf->guard_period_us)) % DWT_TS_MASK;
 
-		/* uint8_t buf[] = {DWT_MTM_PROTOCOL_ID, DWT_MTM_GLOSSY_TX_ID, node_id, hop}; */
 		struct dwt_glossy_frame_buffer initial_glossy_frame = {
 			.msg_id = DWT_MTM_GLOSSY_TX_ID,
-			/* .flood_initiator_id = node_id, */
 			.hop_count = 0,
 			.rtc_initiation_timestamp = initiator_rtc_ts,
+			.payload_size = 0,
 		};
 
 		to_packed_dwt_ts(initial_glossy_frame.dwt_initiation_timestamp, initiator_dwt_ts);
 
-		setup_tx_frame(dev, (uint8_t *)&initial_glossy_frame, sizeof(struct dwt_glossy_frame_buffer));
+		// Copy payload if provided
+		if (conf->payload && conf->payload_size > 0) {
+			memcpy(initial_glossy_frame.payload, conf->payload, conf->payload_size);
+			initial_glossy_frame.payload_size = conf->payload_size;
+		}
+
+		setup_tx_frame(dev, (uint8_t *)&initial_glossy_frame, offsetof(struct dwt_glossy_frame_buffer, payload) + initial_glossy_frame.payload_size);
 
 		dwt_fast_enable_tx(dev, initiator_dwt_ts & DWT_TS_MASK);
 
@@ -2748,6 +2740,7 @@ int deca_glossy_time_synchronization(const struct  device *dev,
 		dwt_inst->ref   = (int64_t) initiator_dwt_ts;
 		dwt_inst->local = (int64_t) initiator_dwt_ts;
 		result->dist_to_root = 0; // i am groot
+		result->payload_size = 0;
 
 		k_sem_give(&ctx->dev_lock);
 
@@ -2755,15 +2748,14 @@ int deca_glossy_time_synchronization(const struct  device *dev,
 	} else {
 		// retry this section to maybe get one of the other hops if one hop fails
 		bool success = false;
-		for(size_t k = 0; !success && (k < max_depth || !max_depth); k++) {
+		for(size_t k = 0; !success && (k < conf->max_depth || !conf->max_depth); k++) {
 			k_sem_take(&ctx->dev_lock, K_FOREVER);
-			dwt_enable_rx(dev, timeout_us + (timeout_us > 0 ? guard_period_us : 0), 0);
+			dwt_enable_rx(dev, timeout_us + (timeout_us > 0 ? conf->guard_period_us : 0), 0);
 			k_sem_give(&ctx->dev_lock);
 
 			irq_state = wait_for_phy(dev);
 
 			if(irq_state == DWT_IRQ_RX) {
-				/* local_rtc_ts = k_uptime_ticks(); */
 				local_rtc_ts = k_cycle_get_32();
 				success = true;
 
@@ -2780,13 +2772,6 @@ int deca_glossy_time_synchronization(const struct  device *dev,
 				uint8_t buf[pkt_len];
 
 				// --- read received frame and check for validity
-				if((pkt_len - 2) != sizeof(struct dwt_glossy_frame_buffer)) {
-					dwt_switch_buffers(dev);
-					k_sem_give(&ctx->dev_lock);
-					ret = -EIO;
-					goto cleanup;
-				}
-
 				dwt_register_read(dev, DWT_RX_BUFFER_ID, 0, pkt_len, buf);
 
 				if(buf[0] != DWT_MTM_GLOSSY_TX_ID) {
@@ -2794,37 +2779,33 @@ int deca_glossy_time_synchronization(const struct  device *dev,
 					k_sem_give(&ctx->dev_lock);
 					ret = -EIO;
 					goto cleanup;
-				} else {
-					memcpy(&glossy_frame, buf, sizeof(struct dwt_glossy_frame_buffer));
 				}
+
+				memcpy(&glossy_frame, buf, pkt_len-2);
 
 				glossy_frame.hop_count++;
 				local_dwt_ts = dwt_rx_timestamp_from_rx_info(&rx_info);
 
-				// random offset
-				/* local_dwt_ts += (uint64_t) sys_rand32_get() % (UUS_TO_DWT_TS(60)); */
-
-				// use hash instead of sys_rand32  for random offset
-				/* local_dwt_ts += (uint64_t) sys_hash32(&local_dwt_ts, sizeof(local_dwt_ts)) % (UUS_TO_DWT_TS(100)); */
-
 				dwt_switch_buffers(dev);
-				setup_tx_frame(dev, (uint8_t *)&glossy_frame, sizeof(struct dwt_glossy_frame_buffer));
-				dwt_fast_enable_tx(dev, (local_dwt_ts + UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us)) % DWT_TS_MASK);
+
+				setup_tx_frame(dev, (uint8_t *)&glossy_frame, offsetof(struct dwt_glossy_frame_buffer, payload) + glossy_frame.payload_size);
+				dwt_fast_enable_tx(dev, (local_dwt_ts + UUS_TO_DWT_TS(conf->transmission_delay_us)) % DWT_TS_MASK);
 				// now we have some time for doing further work on the mcu without affecting the timing above
 
 				// read from glossy frame
 				rtc_inst->ref = (int64_t) glossy_frame.rtc_initiation_timestamp;
 				dwt_inst->ref = (int64_t) from_packed_dwt_ts(glossy_frame.dwt_initiation_timestamp);
 
-				/* 152 */
 				struct dwt_phy_config *rf_cfg = &ctx->rf_cfg;
 				float t_psdu = (rf_cfg->t_dsym * (float) sizeof(struct dwt_glossy_frame_buffer) * 8);
 				int frame_duration_us = (int)((rf_cfg->t_phr + t_psdu) / 1000.f);
-				rtc_inst->local = local_rtc_ts - (((glossy_frame.hop_count * (uint64_t) mtm_glossy_conf.transmission_delay_us) + 227 + guard_period_us) * CONFIG_SYS_CLOCK_TICKS_PER_SEC) / 1000000;
+				rtc_inst->local = local_rtc_ts - (((glossy_frame.hop_count * (uint64_t) conf->transmission_delay_us) + 227 + conf->guard_period_us) * CONFIG_SYS_CLOCK_TICKS_PER_SEC) / 1000000;
 				/* Attention: here we subtract one from the hop_count since we align the RMARKERS, not the point
 				 * where the reception/transmission commands are issued */
-				dwt_inst->local = local_dwt_ts - (glossy_frame.hop_count-1) * (uint64_t) UUS_TO_DWT_TS(mtm_glossy_conf.transmission_delay_us) + (uint64_t) UUS_TO_DWT_TS(guard_period_us);
+				dwt_inst->local = local_dwt_ts - (glossy_frame.hop_count-1) * (uint64_t) UUS_TO_DWT_TS(conf->transmission_delay_us) + (uint64_t) UUS_TO_DWT_TS(conf->guard_period_us);
 				result->dist_to_root = glossy_frame.hop_count;
+				result->payload_size = glossy_frame.payload_size;
+				result->payload = received_glossy_payload;
 
 				k_sem_give(&ctx->dev_lock);
 				irq_state = wait_for_phy(dev);
@@ -2843,11 +2824,10 @@ int deca_glossy_time_synchronization(const struct  device *dev,
 	} else if (irq_state != DWT_IRQ_TX) {
 	}
 
-
 	// lets do something unconventional here and reenable the initiator again for rx, this allows us to measure the otherwise unmeasureable delay that is induced by
 	// the time duration between reception of the frame and the processing of the subsequent interrupt. We can then, since we know the exact re-transmission duration
 	// calculate this delay by comparing our initial local rtc timestamp and the one of the captured retransmission of the other node
-	if (initiator)  {
+	if (conf->isRoot)  {
 		uint32_t new_initiator_rtc_ts;
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
 		dwt_enable_rx(dev, 1000, 0);
@@ -2869,26 +2849,16 @@ int deca_glossy_time_synchronization(const struct  device *dev,
 			pkt_len = rx_finfo & DWT_RX_FINFO_RXFLEN_MASK;
 			uint8_t buf[pkt_len];
 
-
-			// --- read received frame and check for validity
-			if((pkt_len - 2) != sizeof(struct dwt_glossy_frame_buffer)) {
-				dwt_switch_buffers(dev);
-				k_sem_give(&ctx->dev_lock);
-				ret = -EIO;
-				goto cleanup;
-			}
-
 			dwt_register_read(dev, DWT_RX_BUFFER_ID, 0, pkt_len, buf);
 			if(buf[0] != DWT_MTM_GLOSSY_TX_ID) {
 				dwt_switch_buffers(dev);
 				k_sem_give(&ctx->dev_lock);
 				ret = -EIO;
 				goto cleanup;
-			} else {
-				memcpy(&glossy_frame, buf, sizeof(struct dwt_glossy_frame_buffer));
 			}
 
-			// ise CONFIG_SYS_CLOCK_TICKS_PER_SEC to cnvert between rtc cycle to us
+			memcpy(&glossy_frame, buf, pkt_len-2);
+
 			/* printk("initiator rtc difference %u\n", (uint32_t) (((new_initiator_rtc_ts - initiator_rtc_ts) * 1000000) / CONFIG_SYS_CLOCK_TICKS_PER_SEC)); */
 
 			dwt_switch_buffers(dev);
@@ -2897,9 +2867,6 @@ int deca_glossy_time_synchronization(const struct  device *dev,
 	}
 
   cleanup:
-	// --- clear bits ----
-	/* atomic_clear_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU); */
-	/* atomic_set_bit(&ctx->state, DWT_STATE_RX_DEF_ON); */
 	ctx->state = old_state;
 	atomic_clear_bit(&ctx->state, DWT_STATE_TX);
 
@@ -2907,7 +2874,6 @@ int deca_glossy_time_synchronization(const struct  device *dev,
 		dwt_enable_rx(dev, 0, 0);
 	}
 
-	// TODO See comment below in deca_ranging
 	k_yield();
 
 	return ret;
