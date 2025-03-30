@@ -1145,8 +1145,9 @@ static enum ieee802154_hw_caps dwt_get_capabilities(const struct device *dev)
 	       IEEE802154_HW_TXTIME;
 }
 
-static uint32_t dwt_get_pkt_duration_ns(struct dwt_context *ctx, uint8_t psdu_len)
+uint32_t dwt_get_pkt_duration_ns(const struct device *dev, uint8_t psdu_len)
 {
+	struct dwt_context *ctx = dev->data;
 	struct dwt_phy_config *rf_cfg = &ctx->rf_cfg;
 	float t_psdu = rf_cfg->t_dsym * psdu_len * 8;
 
@@ -1156,8 +1157,8 @@ static uint32_t dwt_get_pkt_duration_ns(struct dwt_context *ctx, uint8_t psdu_le
 static int dwt_cca(const struct device *dev)
 {
 	struct dwt_context *ctx = dev->data;
-	uint32_t cca_dur = (dwt_get_pkt_duration_ns(ctx, 127) +
-			 dwt_get_pkt_duration_ns(ctx, 5)) /
+	uint32_t cca_dur = (dwt_get_pkt_duration_ns(dev, 127) +
+			 dwt_get_pkt_duration_ns(dev, 5)) /
 			 UWB_PHY_TDSYM_PHR_6M8;
 
 	if (atomic_test_and_set_bit(&ctx->state, DWT_STATE_CCA)) {
@@ -2897,18 +2898,18 @@ struct mtm_round_timing timing = {
 	.prepare_tx_us = 130, // DEPENDENCY ON NODES
 	.prog_rx_ts_us = 41,
 	.frame_handling_us = 230,
-	.irq_handling_us = 100,
+	.irq_handling_us = 91 + 10, // with 10us margin
 };
 
 #warning "we have to include device_count dependency on the prepare_tx_us etc. here as well"
-int dwt_calculate_slot_duration(const struct device *dev, int device_count, int guard_us) {
+int dwt_calculate_slot_duration(const struct device *dev, int timestamps_to_load, int payload_size, int guard_us) {
 	struct dwt_context *ctx = dev->data;
 	struct mtm_round_timing *t = &timing;
 
-	int psdu_len = offsetof(struct deca_ranging_frame, payload) + (device_count * sizeof(struct deca_tagged_timestamp));
-	int tx_duration_us = dwt_get_pkt_duration_ns(ctx, psdu_len)/1000;
+	int psdu_len = offsetof(struct deca_ranging_frame, payload) + (timestamps_to_load * sizeof(struct deca_tagged_timestamp)) + payload_size;
+	int tx_duration_us = dwt_get_pkt_duration_ns(dev, psdu_len)/1000;
 
-	int slot_length_us = MAX(tx_duration_us, MAX(t->prepare_tx_us, t->prog_rx_ts_us) + t->frame_handling_us) + t->irq_handling_us;
+	int slot_length_us =  t->prog_rx_ts_us + MAX(tx_duration_us, t->frame_handling_us) + t->irq_handling_us;
 
 	return slot_length_us + guard_us;
 }
@@ -2968,7 +2969,7 @@ int deca_ranging(const struct device *dev,
 	SW_START(INIT_ROUND_SETUP);
 	// --- PHY setup for ranging round ---
 	k_sem_take(&ctx->dev_lock, K_FOREVER);
-	dwt_setup_rx_timeout(dev, conf->slot_duration_us);
+	dwt_setup_rx_timeout(dev, 900); // max packet transmission will take about 700us
 	// !!frame timeouts are expensive as they require a full receiver soft reset, thus we setup a preamble timeout as well!!
 
 	dwt_setup_preamble_detection_timeout(dev, ranging_conf->preamble_timeout + conf->guard_period_us/8);
@@ -3148,15 +3149,16 @@ int deca_ranging(const struct device *dev,
 			uint16_t future_tx_slot = UINT16_MAX;
 
 			// seek next transmission slot
-			for(size_t i = s+1; i < schedule->slot_count; i++) {
-				struct deca_slot *next_slot = &schedule->slots[i];
-				// later in case we want to have differently sized slots, we can further distinguish here
-				current_frame_transmission_ts += slot_duration;
+			for(size_t i = s; i < schedule->slot_count; i++) {
+				struct deca_slot *slot = &schedule->slots[i];
 
-				if(next_slot->type == DENSE_TX_SLOT) {
+				if(slot->type == DENSE_TX_SLOT) {
 					future_tx_slot = i;
 					break;
 				}
+
+				// later in case we want to have differently sized slots, we can further distinguish here
+				current_frame_transmission_ts += UUS_TO_DWT_TS(slot->duration_us);
 			}
 
 			// --- in the following phase we will send data that we collected throughout the round
@@ -3268,8 +3270,8 @@ int deca_ranging(const struct device *dev,
 		}
 
 		// -- Currently always iterate by slot_duration --
-#warning "optimize so we dont waste time with other slot times, for instance when current slot was a load tx operation, we could use another duration here"
-		slot_start_ts = (slot_start_ts + slot_duration) & DWT_TS_MASK;
+		/* slot_start_ts = (slot_start_ts + slot_duration) & DWT_TS_MASK; */
+		slot_start_ts = (slot_start_ts + UUS_TO_DWT_TS(current_slot->duration_us)) & DWT_TS_MASK;
 	}
 
 	digest->frames = frame_container;

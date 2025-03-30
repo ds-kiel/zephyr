@@ -41,6 +41,7 @@ struct deca_slot {
 		DENSE_IDLE_SLOT,
 	} type;
 
+	/* use dwt_calculate_slot_duration to calculate this duration */
 	uint16_t duration_us;
 
 	union {
@@ -50,10 +51,19 @@ struct deca_slot {
 			size_t payload_size;
 
 			bool load_stored_timestamps;
+
+			/* use this this together with duration_us. If you include a payload in this
+			   transmission slot, you should not max out the slot duration to just fit
+			   the expected amount of timestamps collected, rather you should also leave
+			   some headroom for the payload by decreasing the amount of timestamps to
+			   include in the frame. */
+			int max_load_timestamps;
 		};
 
 		// Meta information for rx
 		struct {
+			/* for most boards running this code it will not feasible to buffer CIRs for all slots, thus we
+			   allow here to active the globally configured CIR handler to process the data directly */
 			bool with_cir_handler;
 			uint16_t from_index, to_index;
 		};
@@ -97,7 +107,8 @@ struct deca_glossy_configuration {
 
 struct __attribute__((__packed__)) deca_tagged_timestamp {
 	dwt_packed_ts_t ts;
-	deca_short_addr_t addr, slot;
+	deca_short_addr_t addr;
+	uint16_t slot;
 };
 
 struct __attribute__((__packed__)) deca_ranging_frame  {
@@ -157,9 +168,8 @@ uint32_t dwt_fs_to_short_ts(uint64_t fs);
 uint64_t dwt_calculate_actual_tx_ts(uint32_t planned_short_ts, uint16_t tx_antenna_delay);
 void     dwt_set_frame_filter(const struct device *dev, bool ff_enable, uint8_t ff_type);
 uint8_t *dwt_get_mac(const struct device *dev);
-int dwt_calculate_slot_duration(const struct device *dev, int device_count, int guard_us);
+int dwt_calculate_slot_duration(const struct device *dev, int timestamps_to_load, int payload_size, int guard_us);
 int dwt_set_channel(const struct device *dev, uint16_t channel);
-
 dwt_ts_t from_packed_dwt_ts(const dwt_packed_ts_t ts);
 void to_packed_dwt_ts(dwt_packed_ts_t ts, dwt_ts_t value);
 
@@ -167,6 +177,7 @@ int      deca_ranging(const struct device *dev, const struct deca_ranging_config
 int      deca_glossy_time_synchronization(const struct  device *dev, struct deca_glossy_configuration *conf, struct deca_glossy_result *result);
 
 int      dwt_mtm_ranging_estimate_duration(const struct device *dev, const struct deca_ranging_configuration *conf);
+uint32_t dwt_get_pkt_duration_ns(const struct device *dev, uint8_t psdu_len);
 void     dwt_set_antenna_delay_rx(const struct device *dev, uint16_t rx_delay_ts);
 void     dwt_set_antenna_delay_tx(const struct device *dev, uint16_t tx_delay_ts);
 uint16_t dwt_antenna_delay_rx(const struct device *dev);
