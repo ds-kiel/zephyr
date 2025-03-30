@@ -2803,6 +2803,9 @@ int deca_glossy_time_synchronization(const struct device *dev,
 				/* Attention: here we subtract one from the hop_count since we align the RMARKERS, not the point
 				 * where the reception/transmission commands are issued */
 				dwt_inst->local = local_dwt_ts - (glossy_frame.hop_count-1) * (uint64_t) UUS_TO_DWT_TS(conf->transmission_delay_us) + (uint64_t) UUS_TO_DWT_TS(conf->guard_period_us);
+
+				// memcpy payload to received_glossy_payload
+				memcpy(received_glossy_payload, glossy_frame.payload, glossy_frame.payload_size);
 				result->dist_to_root = glossy_frame.hop_count;
 				result->payload_size = glossy_frame.payload_size;
 				result->payload = received_glossy_payload;
@@ -2965,7 +2968,7 @@ int deca_ranging(const struct device *dev,
 	SW_START(INIT_ROUND_SETUP);
 	// --- PHY setup for ranging round ---
 	k_sem_take(&ctx->dev_lock, K_FOREVER);
-	dwt_setup_rx_timeout(dev, conf->slot_duration_us - 100);
+	dwt_setup_rx_timeout(dev, conf->slot_duration_us);
 	// !!frame timeouts are expensive as they require a full receiver soft reset, thus we setup a preamble timeout as well!!
 
 	dwt_setup_preamble_detection_timeout(dev, ranging_conf->preamble_timeout + conf->guard_period_us/8);
