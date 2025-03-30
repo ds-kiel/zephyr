@@ -2630,7 +2630,7 @@ static inline uint64_t dwt_read_tx_timestamp(const struct device *dev) {
 }
 
 struct mtm_ranging_timing mtm_ranging_conf = {
-	.phy_activate_rx_delay = UUS_TO_DWT_TS(128 + 16),
+	.phy_activate_rx_delay = UUS_TO_DWT_TS(128 + 36), // give receiver some more time to start up
 	.phase_setup_delay = UUS_TO_DWT_TS(200),
 	.round_setup_delay = UUS_TO_DWT_TS(200),
 	.preamble_timeout = 128/8,
@@ -3090,6 +3090,7 @@ int deca_ranging(const struct device *dev,
 
 				// store frame into frame_container
 				incoming_frame_info->frame = incoming_frame;
+
 				incoming_frame_info->status = DECA_FRAME_OKAY;
 				incoming_frame_info->timestamp = reception_ts - bias_correction;
 				incoming_frame_info->type = DECA_RECEIVED;
