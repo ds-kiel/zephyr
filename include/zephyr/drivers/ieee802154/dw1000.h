@@ -20,12 +20,9 @@ typedef uint8_t dwt_packed_ts_t[5];
 typedef uint64_t dwt_ts_t;
 typedef int (*cir_memory_callback_t)(int slot, const uint8_t *cir_memory, size_t size);
 
-#define DECA_NO_ADDRESS UINT16_MAX
+uint64_t correct_overflow(dwt_ts_t end_ts, dwt_ts_t start_ts);
 
-struct mtm_round_timing {
-	uint32_t round_init_us, initiation_frame_us, init_round_setup_us,
-		prepare_tx_us, prog_rx_ts_us, frame_handling_base_us, frame_handling_per_timestamp_us, irq_handling_us;
-};
+#define DECA_NO_ADDRESS UINT16_MAX
 
 struct mtm_ranging_timing {
 	uint64_t min_slot_length_us,
@@ -127,6 +124,8 @@ struct __attribute__((__packed__)) deca_ranging_frame  {
 	uint8_t  payload_size;
 	uint8_t payload[DWT_MTM_MAX_PAYLOAD]; // payload will be located AFTER reception timestamps
 };
+
+#define DECA_RANGING_FRAME_MAX_FRAME_SIZE sizeof(struct deca_ranging_frame)
 
 struct deca_ranging_frame_container {
 	struct deca_ranging_frame *frame;
