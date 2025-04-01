@@ -20,9 +20,11 @@ typedef uint8_t dwt_packed_ts_t[5];
 typedef uint64_t dwt_ts_t;
 typedef int (*cir_memory_callback_t)(int slot, const uint8_t *cir_memory, size_t size);
 
+#define DECA_NO_ADDRESS UINT16_MAX
+
 struct mtm_round_timing {
 	uint32_t round_init_us, initiation_frame_us, init_round_setup_us,
-		prepare_tx_us, prog_rx_ts_us, frame_handling_us, irq_handling_us;
+		prepare_tx_us, prog_rx_ts_us, frame_handling_base_us, frame_handling_per_timestamp_us, irq_handling_us;
 };
 
 struct mtm_ranging_timing {
@@ -75,12 +77,18 @@ struct deca_schedule {
 	struct deca_slot *slots;
 };
 
+
+struct deca_glossy_time_pair {
+	uint64_t local, ref;
+};
+
 struct deca_ranging_configuration {
 	deca_short_addr_t addr;
 
 	struct deca_schedule *schedule;
-	struct timeutil_sync_instant *deca_clock_synchronization_instance;
+	struct deca_glossy_time_pair *deca_clock_synchronization_instance;
 	uint64_t round_start_offset_us; // only relevant if time sync instant is used
+	uint64_t deca_round_start_ts; // only relevant if time sync instant is used
 
 	uint32_t slot_duration_us, guard_period_us;
 	uint64_t micro_slot_offset_ns;
@@ -113,7 +121,7 @@ struct __attribute__((__packed__)) deca_tagged_timestamp {
 
 struct __attribute__((__packed__)) deca_ranging_frame  {
 	uint8_t  msg_id;      // identifier of which message type during the protocol run we are sending
-	deca_short_addr_t  addr;  // unique identifier of this node for ranging
+	deca_short_addr_t addr;  // unique identifier of this node for ranging
 	dwt_packed_ts_t tx_ts;
 	uint8_t  rx_ts_count; // amount of received timestamps
 	uint8_t  payload_size;
@@ -149,12 +157,14 @@ struct deca_ranging_digest {
 };
 
 struct deca_glossy_result {
-	struct timeutil_sync_instant rtc_clock_sync_instant;
-	struct timeutil_sync_instant deca_clock_synchronization_instance;
+	struct deca_glossy_time_pair rtc_clock_pair;
+	struct deca_glossy_time_pair deca_clock_pair;
 	uint8_t dist_to_root; // aka hop counter
 	size_t payload_size;
 	uint8_t *payload;
 };
+
+int deca_ranging_frame_get_tagged_timestamps(const struct deca_ranging_frame *frame, struct deca_tagged_timestamp **timestamps);
 
 void dwt_set_delayed_tx_short_ts(const struct device *dev, uint32_t short_ts);
 uint64_t dwt_plan_delayed_tx(const struct device *dev, uint64_t uus_delay);
@@ -177,7 +187,7 @@ int      deca_ranging(const struct device *dev, const struct deca_ranging_config
 int      deca_glossy_time_synchronization(const struct  device *dev, struct deca_glossy_configuration *conf, struct deca_glossy_result *result);
 
 int      dwt_mtm_ranging_estimate_duration(const struct device *dev, const struct deca_ranging_configuration *conf);
-uint32_t dwt_get_pkt_duration_ns(const struct device *dev, uint8_t psdu_len);
+uint32_t dwt_get_pkt_duration_ns(const struct device *dev, uint16_t psdu_len);
 void     dwt_set_antenna_delay_rx(const struct device *dev, uint16_t rx_delay_ts);
 void     dwt_set_antenna_delay_tx(const struct device *dev, uint16_t tx_delay_ts);
 uint16_t dwt_antenna_delay_rx(const struct device *dev);

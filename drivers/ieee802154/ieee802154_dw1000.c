@@ -71,7 +71,27 @@ static bool spi_initialized;
 
 #include <zephyr/drivers/ieee802154/dw1000.h>
 
-#define ANALYZE_DWT_TIMING 0
+#define IRQ_DEBUG 1
+#define ANALYZE_DWT_TIMING 1
+
+#if IRQ_DEBUG
+struct irq_log_entry {
+	uint32_t sys_stat;
+};
+
+struct {
+	uint8_t count;
+	struct irq_log_entry logs[100];
+} irq_logs = {
+	.count = 0,
+};
+
+#define SAVE_IRQ_TO_LOG(sys_stat) do { irq_logs.logs[irq_logs.count].sys_stat = sys_stat; irq_logs.count++; } while(0)
+#define OUTPUT_IRQ_LOGS() do { for(int i = 0; i < irq_logs.count; i++) { printk("%08x ", irq_logs.logs[i].sys_stat); } printk("\n"); irq_logs.count = 0;} while(0)
+#else
+#define SAVE_IRQ_TO_LOG(sys_stat)
+#define OUTPUT_IRQ_LOGS()
+#endif
 
 #if ANALYZE_DWT_TIMING
 struct timing_log {
@@ -96,7 +116,7 @@ void reset_timing_logs() {
 
 void output_timing_logs() {
 	for(int i = 0; i < timing_logs.count; i++) {
-		LOG_WRN("%s: %llu [us]", timing_logs.logs[i].label, timing_logs.logs[i].timestamp_ns / 1000);
+		printk("%s: %llu [us]\n", timing_logs.logs[i].label, timing_logs.logs[i].timestamp_ns / 1000);
 	}
 }
 
@@ -106,13 +126,13 @@ void output_timing_logs() {
 #define SW_END(NAME)
 #endif
 
-SW_DEFINE(ROUND_INIT);
-SW_DEFINE(INITIATION_FRAME);
-SW_DEFINE(INIT_ROUND_SETUP);
-SW_DEFINE(PREPARE_TX);
-SW_DEFINE(PROG_RX_TX);
-SW_DEFINE(FRAME_HANDLING);
-SW_DEFINE(IRQ_WAIT_DELAY);
+/* SW_DEFINE(ROUND_INIT); */
+/* SW_DEFINE(INITIATION_FRAME); */
+/* SW_DEFINE(INIT_ROUND_SETUP); */
+/* SW_DEFINE(PREPARE_TX); */
+/* SW_DEFINE(PROG_RX_TX); */
+/* SW_DEFINE(FRAME_HANDLING); */
+/* SW_DEFINE(IRQ_WAIT_DELAY); */
 SW_DEFINE(IRQ_HANDLING);
 
 #define DT_DRV_COMPAT decawave_dw1000
@@ -960,15 +980,6 @@ rx_out_enable_rx:
 	}
 }
 
-static inline void dwt_irq_minimal_rx_handler(const struct device *dev, uint32_t sys_stat)
-{
-	struct dwt_context *ctx = dev->data;
-
-	dwt_reg_write_u32(dev, DWT_SYS_STATUS_ID, 0, sys_stat & DWT_SYS_STATUS_ALL_RX_GOOD);
-
-	ctx->phy_irq_event = DWT_IRQ_RX;
-}
-
 static inline void dwt_irq_handle_tx(const struct device *dev, uint32_t sys_stat)
 {
 	struct dwt_context *ctx = dev->data;
@@ -1069,34 +1080,36 @@ static void dwt_irq_handle_half_delay(const struct device *dev, uint32_t sys_sta
 	}
 }
 
-
+static int pin_state;
 static void dwt_irq_work_handler(struct k_work *item)
 {
-	SW_START(IRQ_HANDLING);
 	struct dwt_context *ctx = CONTAINER_OF(item, struct dwt_context,
-					       irq_cb_work);
+		irq_cb_work);
 	const struct device *dev = ctx->dev;
+	/* const struct dwt_hi_cfg *hi_cfg = dev->config; */
 	uint32_t sys_stat;
 	uint8_t free_phybet = 0; // there might be other interrupt events upon which we don't want to free the phy semaphore
 
+	// work around double buffering bug see ERRATA: IRQ-1
+	/* pin_state = gpio_pin_get_dt(&hi_cfg->irq_gpio); */
 	k_sem_take(&ctx->dev_lock, K_FOREVER);
 
 	sys_stat = dwt_reg_read_u32(dev, DWT_SYS_STATUS_ID, 0);
-
-	if(log_spi) {
-		printk("b 0x%08x\n", sys_stat);
-	}
-
+	SAVE_IRQ_TO_LOG(sys_stat);
 
 	/* LOG_ERR("b 0x%08x", sys_stat); */
 	if (sys_stat & DWT_SYS_STATUS_RXFCG) {
 		if (atomic_test_bit(&ctx->state, DWT_STATE_IRQ_POLLING_EMU)) {
-			dwt_irq_minimal_rx_handler(dev, sys_stat);
+			dwt_reg_write_u32(dev, DWT_SYS_STATUS_ID, 0, (sys_stat & DWT_SYS_STATUS_ALL_RX_GOOD));
 		} else if (atomic_test_bit(&ctx->state, DWT_STATE_CCA)) {
 			dwt_irq_handle_rx_cca(dev);
 		} else {
 			dwt_irq_handle_rx(dev, sys_stat);
 		}
+	}
+
+	if(sys_stat & DWT_SYS_STATUS_ALL_DBLBUFF) {
+		ctx->phy_irq_event = DWT_IRQ_RX;
 		free_phybet = 1;
 	}
 
@@ -1127,15 +1140,18 @@ static void dwt_irq_work_handler(struct k_work *item)
 	}
 }
 
+
 static void dwt_gpio_callback(const struct device *dev,
 			      struct gpio_callback *cb, uint32_t pins)
 {
 	struct dwt_context *ctx = CONTAINER_OF(cb, struct dwt_context, gpio_cb);
+	const struct dwt_hi_cfg *hi_cfg = ctx->dev->config;
 
-	LOG_DBG("IRQ callback triggered %p", ctx);
-	/* k_work_submit(&ctx->irq_cb_work); */
-
-	k_work_submit_to_queue(&dwt_work_queue, &ctx->irq_cb_work);
+	// only dispatch if gpio line is high
+	pin_state = gpio_pin_get_dt(&hi_cfg->irq_gpio);
+	if(pin_state > 0) {
+		k_work_submit_to_queue(&dwt_work_queue, &ctx->irq_cb_work);
+	}
 }
 
 static enum ieee802154_hw_caps dwt_get_capabilities(const struct device *dev)
@@ -1145,7 +1161,7 @@ static enum ieee802154_hw_caps dwt_get_capabilities(const struct device *dev)
 	       IEEE802154_HW_TXTIME;
 }
 
-uint32_t dwt_get_pkt_duration_ns(const struct device *dev, uint8_t psdu_len)
+uint32_t dwt_get_pkt_duration_ns(const struct device *dev, uint16_t psdu_len)
 {
 	struct dwt_context *ctx = dev->data;
 	struct dwt_phy_config *rf_cfg = &ctx->rf_cfg;
@@ -1332,6 +1348,7 @@ static int dwt_set_power(const struct device *dev, int16_t dbm)
 #define DWT_TS_TO_US(X) (((X)*15650)/1000000000)
 #define DWT_TS_MASK (0xFFFFFFFFFF)
 #define UUS_TO_DWT_TS(X) (((uint64_t)X)*(uint64_t)65536)
+#define US_TO_DWT_TS(X) (((uint64_t)X)*(uint64_t)63875)
 #define NS_TO_DWT_TS(ns) ((((uint64_t)ns*1000*1000)/15650))
 
 static inline int setup_tx_frame(const struct device *dev, const uint8_t *data, uint8_t len) {
@@ -2044,6 +2061,8 @@ static int dwt_initialise_dev(const struct device *dev)
 	     DWT_SYS_STATUS_CPLOCK)) {
 		LOG_WRN("PLL has not locked");
 		return -EIO;
+	} else {
+		dwt_reg_write_u32(dev, DWT_SYS_STATUS_ID, 0, DWT_SYS_STATUS_CPLOCK);
 	}
 
 	dwt_set_spi_fast(dev);
@@ -2156,6 +2175,9 @@ static int dwt_configure_rf_phy(const struct device *dev)
 
 	sys_cfg = dwt_reg_read_u32(dev, DWT_SYS_CFG_ID, 0);
 	tx_fctrl = dwt_reg_read_u32(dev, DWT_TX_FCTRL_ID, 0);
+
+	/* disable smart power control */
+	/* sys_cfg |= DWT_SYS_CFG_DIS_STXP; */
 
 	/* Don't allow 0 - SFD timeout will always be enabled */
 	if (sfdto == 0) {
@@ -2630,11 +2652,11 @@ static inline uint64_t dwt_read_tx_timestamp(const struct device *dev) {
 }
 
 struct mtm_ranging_timing mtm_ranging_conf = {
-	.phy_activate_rx_delay = UUS_TO_DWT_TS(128 + 36), // give receiver some more time to start up
-	.phase_setup_delay = UUS_TO_DWT_TS(200),
-	.round_setup_delay = UUS_TO_DWT_TS(200),
+	.phy_activate_rx_delay = US_TO_DWT_TS(128 + 36), // give receiver some more time to start up
+	.phase_setup_delay = US_TO_DWT_TS(200),
+	.round_setup_delay = US_TO_DWT_TS(200),
 	.preamble_timeout = 128/8,
-	.preamble_chunk_duration = UUS_TO_DWT_TS(8), // 8 symbols per cross-correlated chunk
+	.preamble_chunk_duration = US_TO_DWT_TS(8), // 8 symbols per cross-correlated chunk
 };
 
 #warning "we don't receive the full 128 pacc symbols, is our timing completely correct here? Maybe check phy_activate_rx_delay again"
@@ -2674,8 +2696,8 @@ int deca_glossy_time_synchronization(const struct device *dev,
 	struct deca_glossy_configuration *conf, struct deca_glossy_result *result) {
 	int ret = 0;
  	struct dwt_context *ctx = dev->data;
-	struct timeutil_sync_instant *rtc_inst = &result->rtc_clock_sync_instant;
-	struct timeutil_sync_instant *dwt_inst = &result->deca_clock_synchronization_instance;
+	struct deca_glossy_time_pair *rtc_inst = &result->rtc_clock_pair;
+	struct deca_glossy_time_pair *dwt_inst = &result->deca_clock_pair;
 
 	int irq_state;
 	uint32_t initiator_rtc_ts, local_rtc_ts;
@@ -2715,7 +2737,7 @@ int deca_glossy_time_synchronization(const struct device *dev,
 	if (conf->isRoot) {
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
 		initiator_rtc_ts = k_cycle_get_32();
-		initiator_dwt_ts = (dwt_system_ts(dev) + UUS_TO_DWT_TS(conf->transmission_delay_us + conf->guard_period_us)) % DWT_TS_MASK;
+		initiator_dwt_ts = (dwt_system_ts(dev) + US_TO_DWT_TS(conf->transmission_delay_us + conf->guard_period_us)) % DWT_TS_MASK;
 
 		struct dwt_glossy_frame_buffer initial_glossy_frame = {
 			.msg_id = DWT_MTM_GLOSSY_TX_ID,
@@ -2741,7 +2763,11 @@ int deca_glossy_time_synchronization(const struct device *dev,
 		dwt_inst->ref   = (int64_t) initiator_dwt_ts;
 		dwt_inst->local = (int64_t) initiator_dwt_ts;
 		result->dist_to_root = 0; // i am groot
-		result->payload_size = 0;
+
+		// copy payload into received glossy payload
+		memcpy(received_glossy_payload, initial_glossy_frame.payload, initial_glossy_frame.payload_size);
+		result->payload = received_glossy_payload;
+		result->payload_size = conf->payload_size;
 
 		k_sem_give(&ctx->dev_lock);
 
@@ -2790,7 +2816,7 @@ int deca_glossy_time_synchronization(const struct device *dev,
 				dwt_switch_buffers(dev);
 
 				setup_tx_frame(dev, (uint8_t *)&glossy_frame, offsetof(struct dwt_glossy_frame_buffer, payload) + glossy_frame.payload_size);
-				dwt_fast_enable_tx(dev, (local_dwt_ts + UUS_TO_DWT_TS(conf->transmission_delay_us)) % DWT_TS_MASK);
+				dwt_fast_enable_tx(dev, (local_dwt_ts + US_TO_DWT_TS(conf->transmission_delay_us)) % DWT_TS_MASK);
 				// now we have some time for doing further work on the mcu without affecting the timing above
 
 				// read from glossy frame
@@ -2803,7 +2829,7 @@ int deca_glossy_time_synchronization(const struct device *dev,
 				rtc_inst->local = local_rtc_ts - (((glossy_frame.hop_count * (uint64_t) conf->transmission_delay_us) + 227 + conf->guard_period_us) * CONFIG_SYS_CLOCK_TICKS_PER_SEC) / 1000000;
 				/* Attention: here we subtract one from the hop_count since we align the RMARKERS, not the point
 				 * where the reception/transmission commands are issued */
-				dwt_inst->local = local_dwt_ts - (glossy_frame.hop_count-1) * (uint64_t) UUS_TO_DWT_TS(conf->transmission_delay_us) + (uint64_t) UUS_TO_DWT_TS(conf->guard_period_us);
+				dwt_inst->local = local_dwt_ts - (glossy_frame.hop_count-1) * (uint64_t) US_TO_DWT_TS(conf->transmission_delay_us) + (uint64_t) US_TO_DWT_TS(conf->guard_period_us);
 
 				// memcpy payload to received_glossy_payload
 				memcpy(received_glossy_payload, glossy_frame.payload, glossy_frame.payload_size);
@@ -2897,8 +2923,9 @@ struct mtm_round_timing timing = {
 	.init_round_setup_us = 68,
 	.prepare_tx_us = 130, // DEPENDENCY ON NODES
 	.prog_rx_ts_us = 41,
-	.frame_handling_us = 230,
-	.irq_handling_us = 91 + 10, // with 10us margin
+	.frame_handling_base_us = 180, // per timestamp
+	.frame_handling_per_timestamp_us = 12,
+	.irq_handling_us = 91,
 };
 
 #warning "we have to include device_count dependency on the prepare_tx_us etc. here as well"
@@ -2908,13 +2935,22 @@ int dwt_calculate_slot_duration(const struct device *dev, int timestamps_to_load
 
 	int psdu_len = offsetof(struct deca_ranging_frame, payload) + (timestamps_to_load * sizeof(struct deca_tagged_timestamp)) + payload_size;
 	int tx_duration_us = dwt_get_pkt_duration_ns(dev, psdu_len)/1000;
+	int frame_handling_duration_us = t->frame_handling_base_us + t->frame_handling_per_timestamp_us*timestamps_to_load;
 
-	int slot_length_us =  t->prog_rx_ts_us + MAX(tx_duration_us, t->frame_handling_us) + t->irq_handling_us;
+	int slot_length_us =  t->prog_rx_ts_us + MAX(tx_duration_us, frame_handling_duration_us) + t->irq_handling_us;
 
 	return slot_length_us + guard_us;
 }
 
-// cca duration is again in units of pac size, i.e., generally for our setting it will be in the range of 1..16
+int deca_ranging_frame_get_tagged_timestamps(const struct deca_ranging_frame *frame, struct deca_tagged_timestamp **timestamps) {
+    if (!frame || !timestamps) {
+        return -1; // Error code for invalid parameters
+    }
+
+    *timestamps = (struct deca_tagged_timestamp *)(&frame->payload[frame->payload_size]);
+    return frame->rx_ts_count;
+}
+
 int deca_ranging(const struct device *dev,
 	const struct  deca_ranging_configuration *conf,
 	struct deca_ranging_digest *digest)
@@ -2928,18 +2964,15 @@ int deca_ranging(const struct device *dev,
 	struct mtm_ranging_timing *ranging_conf = &mtm_ranging_conf;
 	struct deca_schedule *schedule = conf->schedule;
 
-	dwt_ts_t round_start_dw_ts, slot_start_ts, slot_duration;
+	dwt_ts_t round_start_dw_ts, slot_start_ts;
 	uint16_t antenna_delay = ctx->tx_ant_dly;
-	size_t stored_timestamp_count;
+	int stored_timestamp_count;
 	atomic_t old_state;
 
 #if ANALYZE_DWT_TIMING
 	reset_timing_logs();
 	timing_start();
 #endif
-
-    	SW_START(ROUND_INIT);
-	slot_duration = UUS_TO_DWT_TS(conf->slot_duration_us);
 
 	// --- Prevent execution of multiple ranging tasks
 	if (atomic_test_and_set_bit(&ctx->state, DWT_STATE_TX)) {
@@ -2964,48 +2997,39 @@ int deca_ranging(const struct device *dev,
 	dwt_double_buffering_align(dev); // for the following execution we require that host and receiver side are aligned
 	k_sem_give(&ctx->dev_lock);
 
-	SW_END(ROUND_INIT);
+	/* SW_END(ROUND_INIT); */
 
-	SW_START(INIT_ROUND_SETUP);
+	/* SW_START(INIT_ROUND_SETUP); */
 	// --- PHY setup for ranging round ---
 	k_sem_take(&ctx->dev_lock, K_FOREVER);
-	dwt_setup_rx_timeout(dev, 900); // max packet transmission will take about 700us
+	dwt_setup_rx_timeout(dev, 1200); // max packet transmission will take about 700us
 	// !!frame timeouts are expensive as they require a full receiver soft reset, thus we setup a preamble timeout as well!!
 
 	dwt_setup_preamble_detection_timeout(dev, ranging_conf->preamble_timeout + conf->guard_period_us/8);
 	k_sem_give(&ctx->dev_lock);
 
-	SW_START(INITIATION_FRAME);
+	/* SW_START(INITIATION_FRAME); */
 	// --- Optional: Round Initiation ---
 	if (conf->deca_clock_synchronization_instance != NULL) {
-		round_start_dw_ts = conf->deca_clock_synchronization_instance->local + UUS_TO_DWT_TS(conf->round_start_offset_us);
+		/* round_start_dw_ts = conf->deca_clock_synchronization_instance->local + US_TO_DWT_TS(conf->round_start_offset_us); */
+		round_start_dw_ts = conf->deca_round_start_ts;
 	} else {
 		// use current transmission timestamp and configuration with guard periods
-		round_start_dw_ts = dwt_system_ts(dev) + slot_duration;
+		round_start_dw_ts = dwt_system_ts(dev) + US_TO_DWT_TS(1000);
 	}
-	SW_END(INITIATION_FRAME);
+	/* SW_END(INITIATION_FRAME); */
 
 	// --- lock execute ranging round ---
 	slot_start_ts = round_start_dw_ts & DWT_TS_MASK;
 
-	// create compiler warning to remember that we have to optimize this here
-#warning "we can probably start right away with a small delay, since we are not really doing anything in the refactored version"
-
-	uint8_t cca_got_slot = 0;
-
 	struct deca_ranging_frame *outgoing_frame = NULL;
-
-	// -- prepare an initial outgoing frame, do the absolute minimum here --
-	outgoing_frame      = &frames[frame_counter];
-	outgoing_frame->rx_ts_count = 0;
-	frame_counter++;
 
         stored_timestamp_count = 0;
 	uint8_t have_frame = 0;
 	uint16_t pkt_len;
 	int cfo;
 	// -- do one more iteration because of double buffered operation --
-	SW_END(INIT_ROUND_SETUP);
+	/* SW_END(INIT_ROUND_SETUP); */
 	for(size_t s = 0; s < schedule->slot_count + 1; s++) {
 		struct deca_slot *current_slot = NULL;
 		enum slot_type type;
@@ -3019,7 +3043,7 @@ int deca_ranging(const struct device *dev,
 
 		// ---- I) kicking of next PHY action ----
 		if ((type == DENSE_RX_SLOT || type == DENSE_TX_SLOT)) {
-			SW_START(PROG_RX_TX);
+			/* SW_START(PROG_RX_TX); */
 			// --- Decide the PHY action to execute ---
 			k_sem_take(&ctx->dev_lock, K_FOREVER);
 			// --- schedule next PHY action ---
@@ -3028,17 +3052,17 @@ int deca_ranging(const struct device *dev,
 				dwt_fast_enable_tx(dev, (slot_start_ts
 						+ NS_TO_DWT_TS(conf->micro_slot_offset_ns)
 						+ ranging_conf->phy_activate_rx_delay
-						+ UUS_TO_DWT_TS(conf->guard_period_us)/2) & DWT_TS_MASK);
+						+ US_TO_DWT_TS(conf->guard_period_us)/2) & DWT_TS_MASK);
 			} else if(type == DENSE_RX_SLOT) {
 				dwt_fast_enable_rx(dev, slot_start_ts & DWT_TS_MASK);
 			}
 			k_sem_give(&ctx->dev_lock);
-			SW_END(PROG_RX_TX);
+			/* SW_END(PROG_RX_TX); */
 		}
 
 		// ---- II) double buffered operation -----
 		if(have_frame) {
-			SW_START(FRAME_HANDLING);
+			/* SW_START(FRAME_HANDLING); */
 			// Note: in slot N we process the frame of slot N-1
 			// -- grab frame and frame info struct for storing the received data --
 
@@ -3051,11 +3075,12 @@ int deca_ranging(const struct device *dev,
 			uint32_t rx_pacc, cir_pwr;
 			uint16_t fp_index;
 			float a_const;
+
 			k_sem_take(&ctx->dev_lock, K_FOREVER);
-
 			dwt_read_rx_info(dev, &rx_info);
-
 			rx_finfo = dwt_reg_read_u32(dev, DWT_RX_FINFO_ID, DWT_RX_FINFO_OFFSET);
+			k_sem_give(&ctx->dev_lock);
+
 			pkt_len = rx_finfo & DWT_RX_FINFO_RXFLEN_MASK;
 			uint8_t rx_buf[pkt_len];
 
@@ -3076,16 +3101,18 @@ int deca_ranging(const struct device *dev,
 			bias_correction = conf->correct_timestamp_bias ? get_range_bias_by_rssi(rx_level) : 0;
 
 			// --- read incoming frame and check for validity
+			k_sem_take(&ctx->dev_lock, K_FOREVER);
 			dwt_register_read(dev, DWT_RX_BUFFER_ID, 0, pkt_len, rx_buf);
+			k_sem_give(&ctx->dev_lock);
 
 			// --- retrieve incoming frame ---
 			memcpy(incoming_frame, rx_buf, pkt_len-2);
 
-			if(incoming_frame->msg_id != DWT_MTM_RANGIN_FRAME_ID) {
+			if(incoming_frame->msg_id != DWT_MTM_RANGIN_FRAME_ID || pkt_len <= offsetof(struct deca_ranging_frame, payload)) {
 				LOG_ERR("invalid ranging frame");
 			} else {
 				dwt_ts_t reception_ts = dwt_rx_timestamp_from_rx_info(&rx_info);
-				struct deca_ranging_frame_container   *incoming_frame_info = &frame_container[frame_container_counter];
+				struct deca_ranging_frame_container  *incoming_frame_info = &frame_container[frame_container_counter];
 				frame_container_counter++;
 
 				// store frame into frame_container
@@ -3109,11 +3136,11 @@ int deca_ranging(const struct device *dev,
 					incoming_frame_info->cfo_ppm = (float) cfo * -0.000573121584378756f;
 				}
 
-				// --- update outgoing frame ---
+				// --- store reception timestamp ---
 				if(conf->reject_frames && ((int) fp_index >> 6) <= conf->fp_index_threshold) {
-					// this informs the upper layer that the frame was rejected and not included in the outgoing frame
+					// this informs the upper layer that the frame was rejected and not included
 					incoming_frame_info->status = DECA_FRAME_REJECTED;
-				} else if(outgoing_frame && outgoing_frame->rx_ts_count < sizeof(outgoing_frame->payload)/sizeof(struct deca_tagged_timestamp)) {
+				} else {
 					struct deca_tagged_timestamp *curr_rx_ts = &stored_timestamps[stored_timestamp_count];
 					to_packed_dwt_ts(curr_rx_ts->ts, reception_ts - bias_correction);
 					curr_rx_ts->addr = incoming_frame->addr;
@@ -3123,29 +3150,16 @@ int deca_ranging(const struct device *dev,
 				}
 			}
 
+			k_sem_take(&ctx->dev_lock, K_FOREVER);
 			dwt_switch_buffers(dev);
-
 			k_sem_give(&ctx->dev_lock);
 			have_frame = 0;
-			SW_END(FRAME_HANDLING);
+			/* SW_END(FRAME_HANDLING); */
 		}
 
 		// -- has to happen after frame handling, since the frame handler during double buffered operation may still add to the outgoing frame --
 		if(type == DENSE_LOAD_TX_BUFFER) {
-			SW_START(PREPARE_TX);
-
-			// check if we have a payload which we should include in this frame
-			if(current_slot->meta.payload != NULL && current_slot->meta.payload_size >= 0) {
-				// check how much space is available in frame for additional data
-				uint8_t occupied_space = (outgoing_frame->rx_ts_count * sizeof(struct deca_tagged_timestamp));
-				if (current_slot->meta.payload_size > sizeof(outgoing_frame->payload) - occupied_space) {
-					LOG_ERR("payload size too high");
-				}
-
-				outgoing_frame->payload_size = current_slot->meta.payload_size;
-				memcpy(outgoing_frame->payload + occupied_space, current_slot->meta.payload, current_slot->meta.payload_size);
-			}
-
+			/* SW_START(PREPARE_TX); */
 			dwt_ts_t current_frame_transmission_ts = slot_start_ts;
 			uint16_t future_tx_slot = UINT16_MAX;
 
@@ -3159,7 +3173,7 @@ int deca_ranging(const struct device *dev,
 				}
 
 				// later in case we want to have differently sized slots, we can further distinguish here
-				current_frame_transmission_ts += UUS_TO_DWT_TS(slot->duration_us);
+				current_frame_transmission_ts += US_TO_DWT_TS(slot->duration_us);
 			}
 
 			// --- in the following phase we will send data that we collected throughout the round
@@ -3167,23 +3181,34 @@ int deca_ranging(const struct device *dev,
 				/* --- store planned transmission timestamp in frame --- */
 				current_frame_transmission_ts =
 					((current_frame_transmission_ts + ranging_conf->phy_activate_rx_delay
-						+ UUS_TO_DWT_TS(conf->guard_period_us)/2
+						+ US_TO_DWT_TS(conf->guard_period_us)/2
 						+ NS_TO_DWT_TS(conf->micro_slot_offset_ns)
 						) & ( (uint64_t) 0xFFFFFFFE00ULL )) + antenna_delay;
 
+				// -- already grab a frame for the next upcoming transmission --
+				outgoing_frame = &frames[frame_counter];
+				frame_counter++;
+
+
 				outgoing_frame->msg_id  = DWT_MTM_RANGIN_FRAME_ID;
 				outgoing_frame->addr = conf->addr;
+				outgoing_frame->payload_size = 0;
+				outgoing_frame->rx_ts_count = 0;
 				to_packed_dwt_ts(outgoing_frame->tx_ts, current_frame_transmission_ts);
 
-				// -- store buffer into frame info struct --
-				struct deca_ranging_frame_container   *outgoing_frame_info = &frame_container[frame_container_counter];
-				frame_container_counter++;
+				// check if we have a payload which we should include in this frame
+				if(current_slot->meta.payload != NULL && current_slot->meta.payload_size > 0) {
+					// check how much space is available in frame for additional data
+					uint8_t occupied_space = (outgoing_frame->rx_ts_count * sizeof(struct deca_tagged_timestamp));
+					if (current_slot->meta.payload_size > sizeof(outgoing_frame->payload) - occupied_space) {
+						LOG_ERR("payload size too high");
+					}
 
-				outgoing_frame_info->frame = outgoing_frame;
-				outgoing_frame_info->timestamp = current_frame_transmission_ts;
-				outgoing_frame_info->slot = future_tx_slot;
-				outgoing_frame_info->type = DECA_TRANSMITTED;
+					outgoing_frame->payload_size = current_slot->meta.payload_size;
+					memcpy(outgoing_frame->payload + occupied_space, current_slot->meta.payload, current_slot->meta.payload_size);
+				}
 
+				// load timestamps
 				if(current_slot->meta.load_stored_timestamps) {
 					int remaining_fitting_timestamps = (sizeof(outgoing_frame->payload)-outgoing_frame->payload_size)/sizeof(struct deca_tagged_timestamp);
 					remaining_fitting_timestamps = MIN(remaining_fitting_timestamps, stored_timestamp_count);
@@ -3194,27 +3219,32 @@ int deca_ranging(const struct device *dev,
 					stored_timestamp_count -= remaining_fitting_timestamps;
 				}
 
+
+				// -- store buffer into frame info struct --
+				struct deca_ranging_frame_container   *outgoing_frame_info = &frame_container[frame_container_counter];
+				frame_container_counter++;
+
+				outgoing_frame_info->frame = outgoing_frame;
+				outgoing_frame_info->timestamp = current_frame_transmission_ts;
+				outgoing_frame_info->slot = future_tx_slot;
+				outgoing_frame_info->type = DECA_TRANSMITTED;
+
 				// --- Finally load frame into transmission buffer ---
 				k_sem_take(&ctx->dev_lock, K_FOREVER);
 				setup_tx_frame(dev, (uint8_t*) outgoing_frame,
 					offsetof(struct deca_ranging_frame, payload)
 					+ outgoing_frame->payload_size + (outgoing_frame->rx_ts_count * sizeof(struct deca_tagged_timestamp)));
 				k_sem_give(&ctx->dev_lock);
-
-				// -- already grab a frame for the next upcoming transmission --
-				outgoing_frame = &frames[frame_counter];
-				outgoing_frame->rx_ts_count = 0;
-				frame_counter++;
 			}
 
-			SW_END(PREPARE_TX);
+			/* SW_END(PREPARE_TX); */
 		}
 
 		// ---- II) Joining with PHY (only relevant if our current slot is a rx or tx operation) -----
 		if ((type == DENSE_RX_SLOT || type == DENSE_TX_SLOT)) {
-			SW_START(IRQ_WAIT_DELAY);
+			/* SW_START(IRQ_WAIT_DELAY); */
 			irq_state = wait_for_phy(dev);
-			SW_END(IRQ_WAIT_DELAY);
+			/* SW_END(IRQ_WAIT_DELAY); */
 
 			if(irq_state == DWT_IRQ_FRAME_WAIT_TIMEOUT) {
 				ret = -ETIMEDOUT;
@@ -3267,12 +3297,11 @@ int deca_ranging(const struct device *dev,
 				LOG_ERR("HALF_DELAY_WARNING");
 				goto cleanup;
 			}
-			SW_END(IRQ_HANDLING);
+			/* SW_END(IRQ_HANDLING); */
 		}
 
 		// -- Currently always iterate by slot_duration --
-		/* slot_start_ts = (slot_start_ts + slot_duration) & DWT_TS_MASK; */
-		slot_start_ts = (slot_start_ts + UUS_TO_DWT_TS(current_slot->duration_us)) & DWT_TS_MASK;
+		slot_start_ts = (slot_start_ts + US_TO_DWT_TS(current_slot->duration_us)) & DWT_TS_MASK;
 	}
 
 	digest->frames = frame_container;
@@ -3299,6 +3328,7 @@ int deca_ranging(const struct device *dev,
 	output_timing_logs();
 #endif
 
+
 /* TODO hmm this is not really nice solution to a deeper problem. In some cases, for instance if we
    are finishing our ranging schedule on a reception, another unexpected interrupt is
    triggered. However, in the last slot, we are not yielding the execution of the current thread (in
@@ -3310,6 +3340,7 @@ int deca_ranging(const struct device *dev,
  */
 	k_yield();
 
+	OUTPUT_IRQ_LOGS();
 	return ret;
 }
 
