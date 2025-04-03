@@ -29,6 +29,8 @@ LOG_MODULE_REGISTER(dw1000, LOG_LEVEL_INF);
 
 #include <zephyr/drivers/gpio.h>
 
+#include <zephyr/drivers/timer/nrf_rtc_timer.h>
+
 #define ZEPHYR_SPI 0
 #define SPIM       0
 
@@ -71,8 +73,8 @@ static bool spi_initialized;
 
 #include <zephyr/drivers/ieee802154/dw1000.h>
 
-#define IRQ_DEBUG 1
-#define ANALYZE_DWT_TIMING 0
+#define IRQ_DEBUG 0
+#define ANALYZE_DWT_TIMING 1
 
 #if IRQ_DEBUG
 struct irq_log_entry {
@@ -81,7 +83,7 @@ struct irq_log_entry {
 
 struct {
 	uint8_t count;
-	struct irq_log_entry logs[100];
+	struct irq_log_entry logs[50];
 } irq_logs = {
 	.count = 0,
 };
@@ -101,7 +103,7 @@ struct timing_log {
 
 struct {
 	uint8_t count;
-	struct timing_log logs[100];
+	struct timing_log logs[30];
 } timing_logs = {
 	.count = 0,
 };
@@ -134,6 +136,7 @@ void output_timing_logs() {
 /* SW_DEFINE(FRAME_HANDLING); */
 /* SW_DEFINE(IRQ_WAIT_DELAY); */
 SW_DEFINE(IRQ_HANDLING);
+SW_DEFINE(SYSTEM_TS);
 
 #define DT_DRV_COMPAT decawave_dw1000
 
@@ -1027,7 +1030,11 @@ static inline void dwt_irq_handle_rxto(const struct device *dev, uint32_t sys_st
 		dwt_reset_rfrx(dev);
 		ctx->phy_irq_event = DWT_IRQ_FRAME_WAIT_TIMEOUT;
 	} else {
-		dwt_reg_write_u32(dev, DWT_SYS_STATUS_ID, 0, DWT_SYS_STATUS_ALL_RX_TO);
+		/* Although the documentation says no soft reset is necessary, I found that after a
+		   preamble timeout, every 1 in 100 frames or something fails to demodulate.
+		   performing a soft reset after a preamble timeout fixes this */
+		dwt_disable_txrx(dev);
+		dwt_reset_rfrx(dev);
 		ctx->phy_irq_event = DWT_IRQ_PREAMBLE_DETECT_TIMEOUT;
 	}
 
@@ -1038,11 +1045,14 @@ static inline void dwt_irq_handle_rxto(const struct device *dev, uint32_t sys_st
 	}
 }
 
+static uint32_t last_rx_err_stat = 0;
 
 // Whole handler takes roughly 90us
 static inline void dwt_irq_handle_error(const struct device *dev, uint32_t sys_stat)
 {
 	struct dwt_context *ctx = dev->data;
+
+	last_rx_err_stat = sys_stat;
 	/* Clear RX error event bits */
 	dwt_reg_write_u32(dev, DWT_SYS_STATUS_ID, 0, DWT_SYS_STATUS_ALL_RX_ERR);
 
@@ -1366,12 +1376,6 @@ static int dwt_set_power(const struct device *dev, int16_t dbm)
 
 	return 0;
 }
-
-#define DWT_TS_TO_US(X) (((X)*15650)/1000000000)
-#define DWT_TS_MASK (0xFFFFFFFFFF)
-#define UUS_TO_DWT_TS(X) (((uint64_t)X)*(uint64_t)65536)
-#define US_TO_DWT_TS(X) (((uint64_t)X)*(uint64_t)63875)
-#define NS_TO_DWT_TS(ns) ((((uint64_t)ns*1000*1000)/15650))
 
 static inline int setup_tx_frame(const struct device *dev, const uint8_t *data, uint8_t len) {
 	uint32_t tx_fctrl;
@@ -2674,10 +2678,11 @@ static inline uint64_t dwt_read_tx_timestamp(const struct device *dev) {
 }
 
 struct mtm_ranging_timing mtm_ranging_conf = {
-	.phy_activate_rx_delay = US_TO_DWT_TS(128 + 36), // give receiver some more time to start up
+	.phy_activate_rx_delay = US_TO_DWT_TS(128 + 36), //+36 // give receiver some more time to start up
 	.phase_setup_delay = US_TO_DWT_TS(200),
 	.round_setup_delay = US_TO_DWT_TS(200),
-	.preamble_timeout = 128/8,
+	.preamble_timeout = (128/8),
+	/* .preamble_timeout = (64/8), */
 	.preamble_chunk_duration = US_TO_DWT_TS(8), // 8 symbols per cross-correlated chunk
 };
 
@@ -2713,6 +2718,15 @@ void to_packed_dwt_ts(dwt_packed_ts_t ts, dwt_ts_t value) {
 #define DWT_MTM_RANGIN_FRAME_ID 0x02
 #define DWT_MTM_GLOSSY_TX_ID 0x03
 #define DWT_MTM_MAX_FRAMES 80
+
+static K_SEM_DEFINE(read_dwt_sys_clock, 0, 1);
+static uint64_t dwt_start_ts = 0;
+void read_deca_system_timestamp(int32_t id, uint64_t expire_time, void *user_data) {
+	const struct device *dev = (const struct device *)user_data;
+
+	dwt_start_ts = dwt_system_ts(dev);
+	k_sem_give(&read_dwt_sys_clock);
+}
 
 int deca_glossy_time_synchronization(const struct device *dev,
 	struct deca_glossy_configuration *conf, struct deca_glossy_result *result) {
@@ -2755,11 +2769,28 @@ int deca_glossy_time_synchronization(const struct device *dev,
 	dwt_double_buffering_align(dev); // for the following execution we require that host and receiver side are aligned
 	k_sem_give(&ctx->dev_lock);
 
+#if ANALYZE_DWT_TIMING
+	reset_timing_logs();
+	timing_start();
+#endif
+
 	// --- Round Initiation ---
 	if (conf->isRoot) {
 		k_sem_take(&ctx->dev_lock, K_FOREVER);
-		initiator_rtc_ts = k_cycle_get_32();
-		initiator_dwt_ts = (dwt_system_ts(dev) + US_TO_DWT_TS(conf->transmission_delay_us + conf->guard_period_us)) % DWT_TS_MASK;
+		/* uint64_t dwt_start_ts; */
+		initiator_rtc_ts = k_cycle_get_32() + 2;
+		z_nrf_rtc_timer_set(1, initiator_rtc_ts, read_deca_system_timestamp, dev);
+		if(k_sem_take(&read_dwt_sys_clock, K_MSEC(100)) != 0) {
+			printk("Failed to read system timestamp\n");
+			ret = -EIO;
+			goto cleanup;
+		}
+
+		/* SW_START(SYSTEM_TS); */
+		/* dwt_start_ts = dwt_system_ts(dev); */
+		/* SW_END(SYSTEM_TS); */
+
+		initiator_dwt_ts = (dwt_start_ts + US_TO_DWT_TS(conf->transmission_delay_us + conf->guard_period_us)) % DWT_TS_MASK;
 
 		struct dwt_glossy_frame_buffer initial_glossy_frame = {
 			.msg_id = DWT_MTM_GLOSSY_TX_ID,
@@ -2826,6 +2857,7 @@ int deca_glossy_time_synchronization(const struct device *dev,
 				if(buf[0] != DWT_MTM_GLOSSY_TX_ID) {
 					dwt_switch_buffers(dev);
 					k_sem_give(&ctx->dev_lock);
+					printk("Wrong frame id received, expected %u, got %u\n", DWT_MTM_GLOSSY_TX_ID, buf[0]);
 					ret = -EIO;
 					goto cleanup;
 				}
@@ -2851,7 +2883,8 @@ int deca_glossy_time_synchronization(const struct device *dev,
 				rtc_inst->local = local_rtc_ts - (((glossy_frame.hop_count * (uint64_t) conf->transmission_delay_us) + 227 + conf->guard_period_us) * CONFIG_SYS_CLOCK_TICKS_PER_SEC) / 1000000;
 				/* Attention: here we subtract one from the hop_count since we align the RMARKERS, not the point
 				 * where the reception/transmission commands are issued */
-				dwt_inst->local = local_dwt_ts - (glossy_frame.hop_count-1) * (uint64_t) US_TO_DWT_TS(conf->transmission_delay_us) + (uint64_t) US_TO_DWT_TS(conf->guard_period_us);
+				// TODO check whether we want to offset by the guard period, in theory theres no strict requirement to perfectly align mcu and DWT time (uint64_t) US_TO_DWT_TS(conf->guard_period_us);
+				dwt_inst->local = local_dwt_ts - (glossy_frame.hop_count-1) * (uint64_t) US_TO_DWT_TS(conf->transmission_delay_us);
 
 				// memcpy payload to received_glossy_payload
 				memcpy(received_glossy_payload, glossy_frame.payload, glossy_frame.payload_size);
@@ -2868,9 +2901,11 @@ int deca_glossy_time_synchronization(const struct device *dev,
 	// transmission handling
 	if(irq_state == DWT_IRQ_ERR) {
 		ret = -EIO;
+		printk("Error in Glossy transmission, SYS_STATUS: 0x%08x\n", dwt_reg_read_u32(dev, DWT_SYS_STATUS_ID, 0));
 		goto cleanup;
 	} else if (irq_state == DWT_IRQ_FRAME_WAIT_TIMEOUT ||
 		   irq_state == DWT_IRQ_PREAMBLE_DETECT_TIMEOUT) {
+		printk("Error in Glossy transmission, SYS_STATUS: 0x%08x\n", dwt_reg_read_u32(dev, DWT_SYS_STATUS_ID, 0));
 		ret = -ETIMEDOUT;
 		goto cleanup;
 	} else if (irq_state != DWT_IRQ_TX) {
@@ -2917,6 +2952,10 @@ int deca_glossy_time_synchronization(const struct device *dev,
 			k_sem_give(&ctx->dev_lock);
 		}
 	}
+#if ANALYZE_DWT_TIMING
+	timing_stop();
+	output_timing_logs();
+#endif
 
   cleanup:
 	ctx->state = old_state;
@@ -2965,7 +3004,7 @@ int dwt_calculate_slot_duration(const struct device *dev, int timestamps_to_load
 	struct mtm_round_timing *t = &timing;
 
 	int psdu_len = offsetof(struct deca_ranging_frame, payload) + (timestamps_to_load * sizeof(struct deca_tagged_timestamp)) + payload_size;
-	int tx_duration_us = dwt_get_pkt_duration_ns(dev, psdu_len)/1000;
+	int tx_duration_us = dwt_get_pkt_duration_ns(dev, psdu_len)/1000;// + 36;
 	int frame_handling_duration_us = t->frame_handling_base_us + t->frame_handling_per_timestamp_us*timestamps_to_load;
 
 	int slot_length_us =  t->prog_rx_ts_us + MAX(tx_duration_us, frame_handling_duration_us) + t->irq_handling_us;
@@ -3072,13 +3111,6 @@ int deca_ranging(const struct device *dev,
 			type = DENSE_IDLE_SLOT;
 		}
 
-		/* if(finished_frame) { */
-		/* 	k_sem_take(&ctx->dev_lock, K_FOREVER); */
-		/* 	dwt_switch_buffers(dev); */
-		/* 	finished_frame = 0; */
-		/* 	k_sem_give(&ctx->dev_lock); */
-		/* } */
-
 		// ---- I) kicking of next PHY action ----
 		if ((type == DENSE_RX_SLOT || type == DENSE_TX_SLOT)) {
 			/* SW_START(PROG_RX_TX); */
@@ -3091,7 +3123,6 @@ int deca_ranging(const struct device *dev,
 						+ ranging_conf->phy_activate_rx_delay
 						+ US_TO_DWT_TS(conf->guard_period_us)/2) & DWT_TS_MASK);
 			} else if(type == DENSE_RX_SLOT) {
-
 				dwt_fast_enable_rx(dev, slot_start_ts & DWT_TS_MASK);
 			}
 			k_sem_give(&ctx->dev_lock);
@@ -3257,13 +3288,12 @@ int deca_ranging(const struct device *dev,
 				// check if we have a payload which we should include in this frame
 				if(current_slot->meta.payload != NULL && current_slot->meta.payload_size > 0) {
 					// check how much space is available in frame for additional data
-					uint8_t occupied_space = (outgoing_frame->rx_ts_count * sizeof(struct deca_tagged_timestamp));
-					if (current_slot->meta.payload_size > sizeof(outgoing_frame->payload) - occupied_space) {
+					if (current_slot->meta.payload_size > DWT_MTM_MAX_PAYLOAD) {
 						LOG_ERR("payload size too high");
 					}
 
 					outgoing_frame->payload_size = current_slot->meta.payload_size;
-					memcpy(outgoing_frame->payload + occupied_space, current_slot->meta.payload, current_slot->meta.payload_size);
+					memcpy(outgoing_frame->payload, current_slot->meta.payload, current_slot->meta.payload_size);
 				}
 
 				// load timestamps
@@ -3308,7 +3338,10 @@ int deca_ranging(const struct device *dev,
 				ret = -ETIMEDOUT;
 				goto cleanup;
 			} else if( irq_state == DWT_IRQ_PREAMBLE_DETECT_TIMEOUT) {
-				SAVE_UINT32_TO_LOG(s | 0xF000);
+
+				uint32_t sys_status = dwt_reg_read_u32(dev, DWT_SYS_STATUS_ID, 0);
+				SAVE_UINT32_TO_LOG(s | 0xF000); // | sys_state
+				SAVE_UINT32_TO_LOG(sys_status); // | sys_state
 			} else if(irq_state == DWT_IRQ_RX) {
 				have_frame = 1;
 
@@ -3352,6 +3385,8 @@ int deca_ranging(const struct device *dev,
 				   we should add about 90 microseconds to the slot duration,
 				   in order to not miss subsequent frames. */
 				SAVE_UINT32_TO_LOG(s | 0xE000);
+				SAVE_UINT32_TO_LOG(last_rx_err_stat);
+
 			} else if(irq_state == DWT_IRQ_HALF_DELAY_WARNING) {
 				ret = -EOVERFLOW;
 				goto cleanup;

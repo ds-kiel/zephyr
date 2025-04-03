@@ -23,6 +23,12 @@ typedef int (*cir_memory_callback_t)(int slot, const uint8_t *cir_memory, size_t
 uint64_t correct_overflow(dwt_ts_t end_ts, dwt_ts_t start_ts);
 
 #define DECA_NO_ADDRESS UINT16_MAX
+#define DWT_TS_TO_US(X) (((X)*15650)/1000000000)
+#define DWT_TS_MASK (0xFFFFFFFFFF)
+#define UUS_TO_DWT_TS(X) (((uint64_t)X)*(uint64_t)65536)
+#define US_TO_DWT_TS(X) (((uint64_t)X)*(uint64_t)63875)
+#define NS_TO_DWT_TS(ns) ((((uint64_t)ns*1000*1000)/15650))
+
 
 struct mtm_ranging_timing {
 	uint64_t min_slot_length_us,

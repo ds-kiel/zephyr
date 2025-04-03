@@ -153,14 +153,10 @@
 	};
 };
 
-//&rtc0 {
-//        status = "okay";
-//  };
-
-// &systick {
-//  	/* Use RTC for system clock, instead of SysTick. */
-//  	status = "okay";
-// };
+&systick {
+ 	/* Use RTC for system clock, instead of SysTick. */
+ 	status = "disabled";
+};
 
 
 &pwm0 {
