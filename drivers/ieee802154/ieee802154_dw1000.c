@@ -74,7 +74,13 @@ static bool spi_initialized;
 #include <zephyr/drivers/ieee802154/dw1000.h>
 
 #define IRQ_DEBUG 0
-#define ANALYZE_DWT_TIMING 1
+#define ANALYZE_DWT_TIMING 0
+#define WITH_CRC 1
+#if WITH_CRC
+#define FRAME_LENGTH_ADDITIONAL 2
+#else
+#define FRAME_LENGTH_ADDITIONAL 1
+#endif
 
 #if IRQ_DEBUG
 struct irq_log_entry {
@@ -108,9 +114,13 @@ struct {
 	.count = 0,
 };
 
+
 #define SW_DEFINE(NAME) static timing_t dbts_start_##NAME = 0; static timing_t dbts_end_##NAME = 0;
 #define SW_START(NAME)  dbts_start_##NAME = timing_counter_get(); //k_cycle_get_32();
 #define SW_END(NAME)    do { dbts_end_##NAME = timing_counter_get(); timing_logs.logs[timing_logs.count].label = #NAME; timing_logs.logs[timing_logs.count].timestamp_ns = timing_cycles_to_ns(timing_cycles_get(&dbts_start_##NAME, &dbts_end_##NAME)); timing_logs.count++; } while(0)
+#define SW_START_ONCE(NAME) do { if(dbts_start_##NAME == 0) { dbts_start_##NAME = timing_counter_get(); } } while(0)
+#define SW_END_ONCE(NAME) do { if(dbts_end_##NAME == 0) { SW_END(NAME); } }  while(0)
+#define SW_RESET(NAME) do { dbts_start_##NAME = 0; dbts_end_##NAME = 0; } while(0) /* only needed if the ONCE macros are used */
 
 void reset_timing_logs() {
 	timing_logs.count = 0;
@@ -126,8 +136,12 @@ void output_timing_logs() {
 #define SW_DEFINE(NAME)
 #define SW_START(NAME)
 #define SW_END(NAME)
+#define SW_START_ONCE(NAME)
+#define SW_END_ONCE(NAME)
+#define SW_RESET(NAME)
 #endif
 
+SW_DEFINE(TIME_TILL_FIRST_FRAME);
 /* SW_DEFINE(ROUND_INIT); */
 /* SW_DEFINE(INITIATION_FRAME); */
 /* SW_DEFINE(INIT_ROUND_SETUP); */
@@ -135,8 +149,10 @@ void output_timing_logs() {
 /* SW_DEFINE(PROG_RX_TX); */
 /* SW_DEFINE(FRAME_HANDLING); */
 /* SW_DEFINE(IRQ_WAIT_DELAY); */
-SW_DEFINE(IRQ_HANDLING);
-SW_DEFINE(SYSTEM_TS);
+/* SW_DEFINE(IRQ_HANDLING); */
+SW_DEFINE(PROG_TO_RX);
+/* SW_DEFINE(IRQ_WORK_HANDLER); */
+/* SW_DEFINE(SYSTEM_TS); */
 
 #define DT_DRV_COMPAT decawave_dw1000
 
@@ -313,8 +329,8 @@ static struct dwt_context dwt_0_context = {
 		.rx_pac_l = DWT_PAC8,
 		.rx_shr_code = 10,
 		.rx_ns_sfd = 0,
-		/* .rx_sfd_to = (129 + 8 - 8), */
-		.rx_sfd_to = (129 + 8 - 8)*2, // use double timeout in case the receiver jumps between transmitters in case of concurrent transmitters
+		.rx_sfd_to = (129 + 8 - 8),
+		/* .rx_sfd_to = (129 + 8 - 8)*2, // use double timeout in case the receiver jumps between transmitters in case of concurrent transmitters */
 
 		.tx_shr_code = 10,
 		.tx_shr_nsync = DWT_PLEN_128,
@@ -1114,6 +1130,7 @@ static void dwt_irq_handle_half_delay(const struct device *dev, uint32_t sys_sta
 static int pin_state;
 static void dwt_irq_work_handler(struct k_work *item)
 {
+	/* SW_START(IRQ_WORK_HANDLER); */
 	struct dwt_context *ctx = CONTAINER_OF(item, struct dwt_context,
 		irq_cb_work);
 	const struct device *dev = ctx->dev;
@@ -2723,7 +2740,6 @@ static K_SEM_DEFINE(read_dwt_sys_clock, 0, 1);
 static uint64_t dwt_start_ts = 0;
 void read_deca_system_timestamp(int32_t id, uint64_t expire_time, void *user_data) {
 	const struct device *dev = (const struct device *)user_data;
-
 	dwt_start_ts = dwt_system_ts(dev);
 	k_sem_give(&read_dwt_sys_clock);
 }
@@ -2862,7 +2878,7 @@ int deca_glossy_time_synchronization(const struct device *dev,
 					goto cleanup;
 				}
 
-				memcpy(&glossy_frame, buf, pkt_len-2);
+				memcpy(&glossy_frame, buf, pkt_len-FRAME_LENGTH_ADDITIONAL);
 
 				glossy_frame.hop_count++;
 				local_dwt_ts = dwt_rx_timestamp_from_rx_info(&rx_info);
@@ -2944,7 +2960,7 @@ int deca_glossy_time_synchronization(const struct device *dev,
 				goto cleanup;
 			}
 
-			memcpy(&glossy_frame, buf, pkt_len-2);
+			memcpy(&glossy_frame, buf, pkt_len-FRAME_LENGTH_ADDITIONAL);
 
 			/* printk("initiator rtc difference %u\n", (uint32_t) (((new_initiator_rtc_ts - initiator_rtc_ts) * 1000000) / CONFIG_SYS_CLOCK_TICKS_PER_SEC)); */
 
@@ -2995,7 +3011,7 @@ struct mtm_round_timing timing = {
 	.voodo_per_timestamp_us = 15, /* voodo time period since we for some reason read garbage if immeditiay read from the double buffered swing set (WHY oh god WHY the receiver tells me the frame is ready, why are you lying to me) */
 	.voodo_base_us = 30 + 20, /* voodo time period since we for some reason read garbage if immeditiay read from the double buffered swing set (WHY oh god WHY the receiver tells me the frame is ready, why are you lying to me) */
 	.frame_handling_per_timestamp_us = 12,
-	.irq_handling_us = 91,
+	.irq_handling_us = 122, /* old value 91 */
 };
 
 #warning "we have to include device_count dependency on the prepare_tx_us etc. here as well"
@@ -3021,6 +3037,31 @@ int deca_ranging_frame_get_tagged_timestamps(const struct deca_ranging_frame *fr
     return frame->rx_ts_count;
 }
 
+
+
+static uint16_t calculate_checksum(const struct deca_ranging_frame *frame, size_t frame_size) {
+    uint16_t checksum = 0;
+    const uint8_t *data = (const uint8_t *)frame;
+    size_t checksum_offset = offsetof(struct deca_ranging_frame, checksum);
+
+    // Calculate checksum for data before the checksum field
+    for (size_t i = 0; i < checksum_offset; i++) {
+        checksum += data[i];
+    }
+
+    // Calculate checksum for data after the checksum field
+    for (size_t i = checksum_offset + sizeof(uint16_t); i < frame_size; i++) {
+        checksum += data[i];
+    }
+
+    return checksum;
+}
+
+static bool verify_checksum(const struct deca_ranging_frame *frame, size_t frame_size) {
+    uint16_t computed_checksum = calculate_checksum(frame, frame_size);
+    return computed_checksum == frame->checksum;
+}
+
 int deca_ranging(const struct device *dev,
 	const struct  deca_ranging_configuration *conf,
 	struct deca_ranging_digest *digest)
@@ -3039,11 +3080,14 @@ int deca_ranging(const struct device *dev,
 	int stored_timestamp_count;
 	atomic_t old_state;
 
+
 #if ANALYZE_DWT_TIMING
+	SW_RESET(TIME_TILL_FIRST_FRAME);
 	reset_timing_logs();
 	timing_start();
 #endif
 
+	SW_START_ONCE(TIME_TILL_FIRST_FRAME);
 	// --- Prevent execution of multiple ranging tasks
 	if (atomic_test_and_set_bit(&ctx->state, DWT_STATE_TX)) {
 		LOG_ERR("Transceiver busy");
@@ -3085,7 +3129,7 @@ int deca_ranging(const struct device *dev,
 		round_start_dw_ts = conf->deca_round_start_ts;
 	} else {
 		// use current transmission timestamp and configuration with guard periods
-		round_start_dw_ts = dwt_system_ts(dev) + US_TO_DWT_TS(1000);
+		round_start_dw_ts = dwt_system_ts(dev) + US_TO_DWT_TS(500);
 	}
 	/* SW_END(INITIATION_FRAME); */
 
@@ -3096,6 +3140,9 @@ int deca_ranging(const struct device *dev,
 
         stored_timestamp_count = 0;
 	uint8_t have_frame = 0, finished_frame = 0;
+	struct dwt_rx_info_regs rx_info;
+	uint32_t rx_finfo;
+
 	uint16_t pkt_len;
 	int cfo;
 	// -- do one more iteration because of double buffered operation --
@@ -3113,7 +3160,7 @@ int deca_ranging(const struct device *dev,
 
 		// ---- I) kicking of next PHY action ----
 		if ((type == DENSE_RX_SLOT || type == DENSE_TX_SLOT)) {
-			/* SW_START(PROG_RX_TX); */
+			SW_END_ONCE(TIME_TILL_FIRST_FRAME);
 			// --- Decide the PHY action to execute ---
 			k_sem_take(&ctx->dev_lock, K_FOREVER);
 			// --- schedule next PHY action ---
@@ -3123,6 +3170,7 @@ int deca_ranging(const struct device *dev,
 						+ ranging_conf->phy_activate_rx_delay
 						+ US_TO_DWT_TS(conf->guard_period_us)/2) & DWT_TS_MASK);
 			} else if(type == DENSE_RX_SLOT) {
+				SW_START(PROG_TO_RX);
 				dwt_fast_enable_rx(dev, slot_start_ts & DWT_TS_MASK);
 			}
 			k_sem_give(&ctx->dev_lock);
@@ -3131,12 +3179,7 @@ int deca_ranging(const struct device *dev,
 
 		// ---- II) double buffered operation -----
 		if(have_frame) {
-			/* Possible bug: if we do not wait here it seems like we some times read
-			   garbage (like 1 every 500-1000 reads)?  This is weird since the buffer we
-			   are reading from should under no circumstances be the one the receiver is
-			   currently writing into
-			 */
-			/* k_busy_wait(80); */
+			// get current system timestamp
 			static uint8_t rx_buf[DECA_RANGING_FRAME_MAX_FRAME_SIZE];
 			/* SW_START(FRAME_HANDLING); */
 			// Note: in slot N we process the frame of slot N-1
@@ -3145,17 +3188,13 @@ int deca_ranging(const struct device *dev,
 			struct deca_ranging_frame *incoming_frame = &frames[frame_counter];
 			frame_counter++;
 
-			struct dwt_rx_info_regs rx_info;
-			uint32_t rx_finfo;
 			int8_t rx_level = INT8_MIN, bias_correction;
 			uint32_t rx_pacc, cir_pwr;
 			uint16_t fp_index;
 			float a_const;
 
-			k_sem_take(&ctx->dev_lock, K_FOREVER);
 			dwt_read_rx_info(dev, &rx_info);
 			rx_finfo = dwt_reg_read_u32(dev, DWT_RX_FINFO_ID, DWT_RX_FINFO_OFFSET);
-			k_sem_give(&ctx->dev_lock);
 
 			pkt_len = rx_finfo & DWT_RX_FINFO_RXFLEN_MASK;
 
@@ -3180,21 +3219,27 @@ int deca_ranging(const struct device *dev,
 
 			// --- read incoming frame and check for validity
 			k_sem_take(&ctx->dev_lock, K_FOREVER);
-			// get current system timestamp
 			dwt_ts_t current_ts = dwt_system_ts(dev);
 			dwt_ts_t time_until_reception = DWT_TS_TO_US(correct_overflow(slot_start_ts, current_ts)) + 30;
+
 			/* SAVE_UINT32_TO_LOG((uint32_t)time_until_reception); */
 			/* otherwise the reception already begin everything good */
 			if(time_until_reception < 1000) {
 				k_busy_wait(time_until_reception);
 			}
-
 			dwt_register_read(dev, DWT_RX_BUFFER_ID, 0, pkt_len, rx_buf);
 			dwt_switch_buffers(dev);
 			k_sem_give(&ctx->dev_lock);
 
 			// --- retrieve incoming frame ---
-			memcpy(incoming_frame, rx_buf, pkt_len-2);
+			if(pkt_len >= sizeof(struct deca_ranging_frame)+FRAME_LENGTH_ADDITIONAL) {
+				LOG_ERR("unexpected frame size\n");
+				ret = -EIO;
+				goto cleanup;
+			}
+
+			memcpy(incoming_frame, rx_buf, pkt_len-FRAME_LENGTH_ADDITIONAL);
+			/* SAVE_UINT32_TO_LOG(pkt_len); */
 
 			if(incoming_frame->msg_id != DWT_MTM_RANGIN_FRAME_ID || pkt_len <= offsetof(struct deca_ranging_frame, payload)) {
 				LOG_ERR("invalid ranging frame");
@@ -3224,8 +3269,11 @@ int deca_ranging(const struct device *dev,
 					incoming_frame_info->cfo_ppm = (float) cfo * -0.000573121584378756f;
 				}
 
+				/* verify checksum */
+				bool frame_valid = verify_checksum(incoming_frame, pkt_len-FRAME_LENGTH_ADDITIONAL);
+
 				// --- store reception timestamp ---
-				if(conf->reject_frames && ((int) fp_index >> 6) <= conf->fp_index_threshold) {
+				if(!frame_valid || (conf->reject_frames && ((int) fp_index >> 6) <= conf->fp_index_threshold)) {
 					// this informs the upper layer that the frame was rejected and not included
 					incoming_frame_info->status = DECA_FRAME_REJECTED;
 				} else {
@@ -3278,7 +3326,6 @@ int deca_ranging(const struct device *dev,
 				outgoing_frame = &frames[frame_counter];
 				frame_counter++;
 
-
 				outgoing_frame->msg_id  = DWT_MTM_RANGIN_FRAME_ID;
 				outgoing_frame->addr = conf->addr;
 				outgoing_frame->payload_size = 0;
@@ -3307,21 +3354,25 @@ int deca_ranging(const struct device *dev,
 					stored_timestamp_count -= remaining_fitting_timestamps;
 				}
 
+				/* calculate checksum */
+				size_t frame_size = offsetof(struct deca_ranging_frame, payload)
+					+ outgoing_frame->payload_size + (outgoing_frame->rx_ts_count * sizeof(struct deca_tagged_timestamp));
+				uint16_t checksum = calculate_checksum(outgoing_frame, frame_size);
+				outgoing_frame->checksum = checksum;
 
 				// -- store buffer into frame info struct --
-				struct deca_ranging_frame_container   *outgoing_frame_info = &frame_container[frame_container_counter];
+				struct deca_ranging_frame_container  *outgoing_frame_info = &frame_container[frame_container_counter];
 				frame_container_counter++;
 
 				outgoing_frame_info->frame = outgoing_frame;
+				outgoing_frame_info->status = DECA_FRAME_OKAY;
 				outgoing_frame_info->timestamp = current_frame_transmission_ts;
 				outgoing_frame_info->slot = future_tx_slot;
 				outgoing_frame_info->type = DECA_TRANSMITTED;
 
 				// --- Finally load frame into transmission buffer ---
 				k_sem_take(&ctx->dev_lock, K_FOREVER);
-				setup_tx_frame(dev, (uint8_t*) outgoing_frame,
-					offsetof(struct deca_ranging_frame, payload)
-					+ outgoing_frame->payload_size + (outgoing_frame->rx_ts_count * sizeof(struct deca_tagged_timestamp)));
+				setup_tx_frame(dev, (uint8_t*) outgoing_frame, frame_size);
 				k_sem_give(&ctx->dev_lock);
 			}
 
@@ -3338,19 +3389,19 @@ int deca_ranging(const struct device *dev,
 				ret = -ETIMEDOUT;
 				goto cleanup;
 			} else if( irq_state == DWT_IRQ_PREAMBLE_DETECT_TIMEOUT) {
-
-				uint32_t sys_status = dwt_reg_read_u32(dev, DWT_SYS_STATUS_ID, 0);
-				SAVE_UINT32_TO_LOG(s | 0xF000); // | sys_state
-				SAVE_UINT32_TO_LOG(sys_status); // | sys_state
+				/* uint32_t sys_status = dwt_reg_read_u32(dev, DWT_SYS_STATUS_ID, 0); */
+				/* SAVE_UINT32_TO_LOG(s | 0xA000); // | sys_state */
+				/* SAVE_UINT32_TO_LOG(sys_status); // | sys_state */
 			} else if(irq_state == DWT_IRQ_RX) {
 				have_frame = 1;
 
 				// ----- NON DOUBLE BUFFERED REGS ------
 				// Read registers not in double buffere swinging register set
+#if CONFIG_DWT_MTM_OUTPUT_CIR
 				if(conf->cfo) {
 					cfo = dwt_readcarrierintegrator(dev);
 				}
-#if CONFIG_DWT_MTM_OUTPUT_CIR
+
 				if(current_slot->meta.with_cir_handler && conf->cir_handler != NULL) {
 					// first we do a bulk extract of the impulse memory
 					/* dwt_register_read(dev, DWT_ACC_MEM_ID, 0, sizeof(cir_acc_mem), cir_acc_mem); */
@@ -3379,15 +3430,23 @@ int deca_ranging(const struct device *dev,
 #endif
 			} else if(irq_state == DWT_IRQ_TX) {
 			} else if(irq_state == DWT_IRQ_ERR) {
+				if(s >= 2) {
+					SW_END(PROG_TO_RX);
+					SAVE_UINT32_TO_LOG(s | 0xE000);
+				}
+
+				/* SW_END(IRQ_WORK_HANDLER); */
 				/* handling rx errors takes a longer time than the other
 				   events, since a receiver reset has to be performed.  thus
-				   if we don't cancel out of this round after a error event,
+				   if we don't return out of this round after a error event,
 				   we should add about 90 microseconds to the slot duration,
 				   in order to not miss subsequent frames. */
-				SAVE_UINT32_TO_LOG(s | 0xE000);
-				SAVE_UINT32_TO_LOG(last_rx_err_stat);
-
+				/* SAVE_UINT32_TO_LOG(s | 0xE000); */
+				/* SAVE_UINT32_TO_LOG(last_rx_err_stat); */
 			} else if(irq_state == DWT_IRQ_HALF_DELAY_WARNING) {
+				uint64_t curr_ts = dwt_system_ts(dev);
+				SAVE_UINT32_TO_LOG(s | 0xF000);
+				SAVE_UINT32_TO_LOG(DWT_TS_TO_US(curr_ts - slot_start_ts));
 				ret = -EOVERFLOW;
 				goto cleanup;
 			}

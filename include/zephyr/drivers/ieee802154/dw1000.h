@@ -123,12 +123,13 @@ struct __attribute__((__packed__)) deca_tagged_timestamp {
 };
 
 struct __attribute__((__packed__)) deca_ranging_frame  {
-	uint8_t  msg_id;      // identifier of which message type during the protocol run we are sending
-	deca_short_addr_t addr;  // unique identifier of this node for ranging
-	dwt_packed_ts_t tx_ts;
-	uint8_t  rx_ts_count; // amount of received timestamps
-	uint8_t  payload_size;
-	uint8_t payload[DWT_MTM_MAX_PAYLOAD]; // payload will be located AFTER reception timestamps
+    uint8_t  msg_id;      // identifier of which message type during the protocol run we are sending
+    uint16_t checksum;    // checksum for frame integrity verification
+    deca_short_addr_t addr;  // unique identifier of this node for ranging
+    dwt_packed_ts_t tx_ts;
+    uint8_t  rx_ts_count; // amount of received timestamps
+    uint8_t  payload_size;
+    uint8_t payload[DWT_MTM_MAX_PAYLOAD]; // payload will be located AFTER reception timestamps
 };
 
 #define DECA_RANGING_FRAME_MAX_FRAME_SIZE sizeof(struct deca_ranging_frame)
