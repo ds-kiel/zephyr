@@ -151,6 +151,7 @@ SW_DEFINE(TIME_TILL_FIRST_FRAME);
 /* SW_DEFINE(IRQ_WAIT_DELAY); */
 /* SW_DEFINE(IRQ_HANDLING); */
 SW_DEFINE(PROG_TO_RX);
+SW_DEFINE(SPI_ACCESS);
 /* SW_DEFINE(IRQ_WORK_HANDLER); */
 /* SW_DEFINE(SYSTEM_TS); */
 
@@ -406,7 +407,7 @@ static int dwt_spi_read(const struct device *dev,
 		.len = hdr_len
 	};
 	const struct spi_buf_set tx = {
-		.frames = &tx_buf,
+		.buffers = &tx_buf,
 		.count = 1
 	};
 	struct spi_buf rx_buf[2] = {
@@ -420,7 +421,7 @@ static int dwt_spi_read(const struct device *dev,
 		},
 	};
 	const struct spi_buf_set rx = {
-		.frames = rx_buf,
+		.buffers = rx_buf,
 		.count = 2
 	};
 
@@ -449,7 +450,7 @@ static int dwt_spi_write(const struct device *dev,
 		{.buf = (uint8_t *)hdr_buf, .len = hdr_len},
 		{.buf = (uint8_t *)data, .len = data_len}
 	};
-	struct spi_buf_set buf_set = {.frames = buf, .count = 2};
+	struct spi_buf_set buf_set = {.buffers = buf, .count = 2};
 
 	LOG_DBG("spi write, header length %u, data length %u",
 		(uint16_t)hdr_len, (uint32_t)data_len);
@@ -2122,6 +2123,7 @@ static int dwt_initialise_dev(const struct device *dev)
 
  	/* Clear AON_CFG1 register */
 	dwt_reg_write_u8(dev, DWT_AON_ID, DWT_AON_CFG1_OFFSET, 0);
+
 	/*
 	 * Configure sleep mode:
 	 *  - On wake-up load configurations from the AON memory
@@ -2986,12 +2988,10 @@ int deca_glossy_time_synchronization(const struct device *dev,
 	return ret;
 }
 
-#if CONFIG_DWT_MTM_OUTPUT_CIR
 // we will directly insert the header into the buffer, because of the limitiations of using nrfx spi
 // directly .Write into this buffer starting from offset 0, but read into it simultanously from
 // offset 1
-static uint8_t cir_acc_mem[4069];
-#endif
+static uint8_t cir_acc_mem[CONFIG_DWT_MTM_CIR_BUFFER_SIZE];
 
 struct mtm_round_timing {
 	uint32_t round_init_us, initiation_frame_us, init_round_setup_us,
@@ -3062,13 +3062,16 @@ static bool verify_checksum(const struct deca_ranging_frame *frame, size_t frame
     return computed_checksum == frame->checksum;
 }
 
+static struct deca_ranging_frame frames[DWT_MTM_MAX_FRAMES];
+static struct deca_ranging_frame_container frame_container[DWT_MTM_MAX_FRAMES];
+/* static struct deca_ranging_frame *get_ranging_frame(); */
+
 int deca_ranging(const struct device *dev,
 	const struct  deca_ranging_configuration *conf,
 	struct deca_ranging_digest *digest)
 {
 	static struct deca_tagged_timestamp stored_timestamps[DWT_MTM_MAX_FRAMES];
-	static struct deca_ranging_frame frames[DWT_MTM_MAX_FRAMES];
-	static struct deca_ranging_frame_container frame_container[DWT_MTM_MAX_FRAMES];
+
 
 	int ret = 0, irq_state, frame_counter = 0, frame_container_counter = 0;
 	struct dwt_context *ctx = dev->data;
@@ -3397,7 +3400,7 @@ int deca_ranging(const struct device *dev,
 
 				// ----- NON DOUBLE BUFFERED REGS ------
 				// Read registers not in double buffere swinging register set
-#if CONFIG_DWT_MTM_OUTPUT_CIR
+
 				if(conf->cfo) {
 					cfo = dwt_readcarrierintegrator(dev);
 				}
@@ -3405,16 +3408,35 @@ int deca_ranging(const struct device *dev,
 				if(current_slot->meta.with_cir_handler && conf->cir_handler != NULL) {
 					// first we do a bulk extract of the impulse memory
 					/* dwt_register_read(dev, DWT_ACC_MEM_ID, 0, sizeof(cir_acc_mem), cir_acc_mem); */
-					dwt_enable_accumulator_memory_access(dev);
 
-					uint16_t to_index = current_slot->meta.to_index, from_index = current_slot->meta.from_index;
+					uint16_t to_index, from_index;
+					if(current_slot->meta.only_first_path) {
+						rx_finfo = dwt_reg_read_u32(dev, DWT_RX_FINFO_ID, DWT_RX_FINFO_OFFSET);
+						int fp_index = dwt_fp_index_from_info_reg(&rx_info);
+
+						from_index = fp_index-1;
+						to_index = from_index+1;
+					} else {
+						to_index = current_slot->meta.to_index;
+						from_index = current_slot->meta.from_index;
+					}
+
+					dwt_enable_accumulator_memory_access(dev);
 					uint16_t offset = from_index * 4;
 					uint8_t tx_buf[3] = {DWT_ACC_MEM_ID | DWT_SPI_TRANS_SUB_ADDR,
 						(uint8_t)(offset & DWT_SPI_TRANS_SHORT_MAX_OFFSET) | DWT_SPI_TRANS_EXTEND_ADDR,
 						(uint8_t)(offset >> 7)};
 
+					if(to_index - from_index > CONFIG_DWT_MTM_CIR_BUFFER_SIZE) {
+						LOG_ERR("Too many samples requested");
+						ret = -EIO;
+						goto cleanup;
+					}
+
 // 4096 is maximum amount we will ever grab here, + 1 because there will always be one garbage byte
+#if !ZEPHYR_SPI
 					spi_transfer(tx_buf, sizeof(tx_buf), cir_acc_mem, (to_index - from_index + 1)*4 + sizeof(tx_buf) + 1);
+#endif
 
 					/*
 					  We are not able to buffer the CIR for every reception in
@@ -3427,7 +3449,6 @@ int deca_ranging(const struct device *dev,
 
 					conf->cir_handler(s, cir_acc_mem+4, (to_index - from_index + 1)*4);
 				}
-#endif
 			} else if(irq_state == DWT_IRQ_TX) {
 			} else if(irq_state == DWT_IRQ_ERR) {
 				if(s >= 2) {

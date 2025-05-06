@@ -71,6 +71,7 @@ struct deca_slot {
 			   allow here to active the globally configured CIR handler to process the data directly */
 			bool with_cir_handler;
 			uint16_t from_index, to_index;
+			bool only_first_path; // only read first path sample
 		};
 	} meta;
 };
